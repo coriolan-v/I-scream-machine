@@ -2,12 +2,12 @@
 #include <I2S.h>
 #include <arduinoFFT.h>
 
-#define BAUD_RATE 115200 
+#define BAUD_RATE 1000000 
 #define SAMPLING_FREQ 16000 
 #define SAMPLES 64        
 
 // --- COMPILATION FLAGS ---
-#define VERBOSE_DEBUG 1  // Set to 1 to view live audio data on your PC Serial Monitor
+#define VERBOSE_DEBUG 0  // Set to 1 for live telemetry, 0 to silence USB output
 
 // Pin Assignments for INMP441 on XIAO RP2040
 #define PIN_SCK      27 
@@ -17,9 +17,8 @@
 
 I2S i2sInput(INPUT);
 
-// The structural rich packet mapping
 struct RichAudioPacket {
-  uint16_t header;          
+  uint16_t header;          // 0xABCD
   uint8_t masterVolume;     
   uint8_t frequencyBins[16]; 
   uint8_t checksum;         
@@ -27,23 +26,22 @@ struct RichAudioPacket {
 
 RichAudioPacket packet;
 
-// FFT Processing Arrays
 double vReal[SAMPLES];
 double vImag[SAMPLES];
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQ);
 
 int sampleCount = 0;
 
-// --- DIAGNOSTIC MONITOR VARIABLES ---
+// Verbose tracking variables
 unsigned long lastTelemPrint = 0;
-const unsigned long telemInterval = 250; // Update local PC monitor every 250ms (~4 FPS)
+const unsigned long telemInterval = 250; // 4 updates per second for readability
 uint32_t totalPacketsSent = 0;
 
 void setup() {
-  // Initialize native USB port for PC local debugging
+#if VERBOSE_DEBUG
   Serial.begin(115200); 
+#endif
   
-  // Set up the long-distance hardware RS-485 serial link
   Serial1.setTX(PIN_UART_TX);
   Serial1.begin(BAUD_RATE);
   
@@ -52,19 +50,15 @@ void setup() {
   i2sInput.setBitsPerSample(24);
   
   if (!i2sInput.begin(SAMPLING_FREQ)) {
-    Serial.println("CRITICAL ERROR: I2S Hardware Bus Failed to Start!");
     while (1); 
   }
   
   packet.header = 0xABCD; 
+  delay(1000);
 
-  delay(1500);
-  Serial.println("\n===========================================");
-  Serial.println("    XIAO RP2040 SMART ENDPOINT SENDER      ");
-  Serial.println("===========================================");
-  Serial.print("RS-485 Data Output on Pin D6 (Serial1) @ "); Serial.println(BAUD_RATE);
-  Serial.println("Processing local 64-point FFT structures...");
-  Serial.println("-------------------------------------------\n");
+#if VERBOSE_DEBUG
+  Serial.println("\n--- XIAO SENDER ACTIVE (VERBOSE DEBUG ON) ---");
+#endif
 }
 
 void loop() {
@@ -72,7 +66,6 @@ void loop() {
     int32_t rawSample = 0;
     i2sInput.read(&rawSample, sizeof(rawSample));
     
-    // Core native sign alignment algorithm
     int32_t processedSample = (rawSample << 8) / 256;
     
     vReal[sampleCount] = (double)processedSample;
@@ -80,33 +73,33 @@ void loop() {
     sampleCount++;
     
     if (sampleCount >= SAMPLES) {
-      // 1. Calculate overall raw volume (RMS style)
+      // 1. Calculate overall Volume
       double sumSquares = 0;
       for (int i = 0; i < SAMPLES; i++) {
         sumSquares += vReal[i] * vReal[i];
       }
       double rms = sqrt(sumSquares / SAMPLES);
-      packet.masterVolume = constrain(map(rms, 0, 8000, 0, 255), 0, 255);
+      packet.masterVolume = constrain(map(rms, 0, 45000, 0, 255), 0, 255);
       
-      // 2. Compute Fast Fourier Transform
+      // 2. Compute FFT
       FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
       FFT.compute(FFT_FORWARD);
       FFT.complexToMagnitude();
       
-      // 3. Compress the complex spectrum down into 16 neat animation bins
+      // 3. Populate frequency bins
       for (int i = 0; i < 16; i++) {
         double val = vReal[i + 2]; 
-        packet.frequencyBins[i] = constrain(map(val, 0, 150000, 0, 255), 0, 255);
+        packet.frequencyBins[i] = constrain(map(val, 0, 900000, 0, 255), 0, 255);
       }
       
-      // 4. Create an XOR data validation checksum
+      // 4. Calculate Checksum
       uint8_t calcCheck = packet.masterVolume;
       for (int i = 0; i < 16; i++) {
         calcCheck ^= packet.frequencyBins[i];
       }
       packet.checksum = calcCheck;
       
-      // 5. Blast uncompressed data footprint instantly to Teensy
+      // 5. Stream the raw binary packet
       Serial1.write((uint8_t*)&packet, sizeof(RichAudioPacket));
       totalPacketsSent++;
       
@@ -114,24 +107,22 @@ void loop() {
     }
   }
 
-  // --- LOCAL SENDER VERBOSE DEBUG PANEL ---
+  // --- LOCAL SENDER TELEMETRY ---
 #if VERBOSE_DEBUG
   unsigned long currentMillis = millis();
   if (currentMillis - lastTelemPrint >= telemInterval) {
     lastTelemPrint = currentMillis;
     
-    Serial.print("[SENDER LOG] Total Packets Shipped: ");
+    Serial.print("[SENDER LOG] Shipped: ");
     Serial.print(totalPacketsSent);
     Serial.print(" | Vol: ");
     Serial.print(packet.masterVolume);
-    
-    // Print a mini ASCII-art bar graph of the frequency spectrum
-    Serial.print(" | EQ Spectrum: [");
+    Serial.print(" | EQ Bins: [");
     for (int i = 0; i < 16; i++) {
-      if (packet.frequencyBins[i] > 180)      Serial.print("#"); // Heavy energy
-      else if (packet.frequencyBins[i] > 80)  Serial.print(":"); // Mid energy
-      else if (packet.frequencyBins[i] > 15)  Serial.print("."); // Low background noise
-      else                                    Serial.print(" "); // Dead silence
+      if (packet.frequencyBins[i] > 150)      Serial.print("#");
+      else if (packet.frequencyBins[i] > 60)  Serial.print(":");
+      else if (packet.frequencyBins[i] > 15)  Serial.print(".");
+      else                                    Serial.print(" ");
     }
     Serial.println("]");
   }
