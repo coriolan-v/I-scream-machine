@@ -1,13 +1,12 @@
 #include <OctoWS2811.h>
 #include <FastLED.h>
 
-#define BAUD_RATE 1000000 
+#define BAUD_RATE 1000000 // Rock solid 1 Megabaud
 #define NUM_STRIPS 12
 #define LEDS_PER_STRIP 200
 #define TOTAL_LEDS (NUM_STRIPS * LEDS_PER_STRIP)
 
-// --- COMPILATION FLAGS ---
-#define VERBOSE_DEBUG 0  // Set to 1 for live telemetry, 0 to silence USB output
+#define VERBOSE_DEBUG 1  
 
 CRGB leds[TOTAL_LEDS];
 const int numPins = 12;
@@ -25,19 +24,47 @@ struct RichAudioPacket {
   uint8_t checksum;         
 };
 
-RichAudioPacket micA; 
+volatile RichAudioPacket micA; 
 
-// Stream Parser State Variables
-enum ParseState { STATE_LOOK_FOR_HEADER_HIGH, STATE_LOOK_FOR_HEADER_LOW, STATE_READ_PAYLOAD };
-ParseState currentState = STATE_LOOK_FOR_HEADER_HIGH;
+// --- NEW ROLLING CIRCULAR STREAM PARSER ---
+#define PACKET_SIZE sizeof(RichAudioPacket)
+uint8_t slidingBuffer[PACKET_SIZE];
 
-uint8_t packetBuffer[sizeof(RichAudioPacket)];
-int bytesRead = 0;
-
-// Telemetry Counters
-uint32_t goodPackets = 0;
-uint32_t badChecksums = 0;
+volatile uint32_t goodPackets = 0;
+volatile uint32_t badChecksums = 0;
 unsigned long lastPrintTime = 0;
+
+IntervalTimer serialParserTimer;
+
+// This interrupt runs every 500 microseconds to pull bits out dynamically
+void parseSerialStream() {
+  while (Serial4.available() > 0) {
+    // Shift all elements in the buffer left by 1 byte
+    for (uint i = 0; i < PACKET_SIZE - 1; i++) {
+      slidingBuffer[i] = slidingBuffer[i + 1];
+    }
+    // Drop the fresh byte into the tail of our sliding window
+    slidingBuffer[PACKET_SIZE - 1] = Serial4.read();
+
+    // Check if the front of our sliding window matches the 0xABCD signature
+    if (slidingBuffer[0] == 0xAB && slidingBuffer[1] == 0xCD) {
+      
+      // Calculate Checksum across the payload inside the frame
+      uint8_t verifyCheck = slidingBuffer[2]; // masterVolume
+      for (int i = 0; i < 16; i++) {
+        verifyCheck ^= slidingBuffer[3 + i]; // EQ bins
+      }
+
+      // Validate against the trailing checksum byte
+      if (verifyCheck == slidingBuffer[PACKET_SIZE - 1]) {
+        goodPackets++;
+        memcpy((void*)&micA, slidingBuffer, PACKET_SIZE);
+      } else {
+        badChecksums++;
+      }
+    }
+  }
+}
 
 void showOctoBuffer() {
   for (int i = 0; i < TOTAL_LEDS; i++) {
@@ -54,86 +81,41 @@ void setup() {
   octo.begin();
   octo.show();
 
-  // Listen on Pin 16 (Serial4)
   Serial4.begin(BAUD_RATE);
-  Serial4.addMemoryForRead(malloc(1024), 1024);
+  Serial4.addMemoryForRead(malloc(2048), 2048);
+
+  // Poll twice as fast (every 500us) to handle the 1 Megabaud flow cleanly
+  serialParserTimer.begin(parseSerialStream, 500);
 
   delay(1000);
-#if VERBOSE_DEBUG
-  Serial.println("\n--- TEENSY RECEIVER ACTIVE (VERBOSE DEBUG ON) ---");
-#endif
 }
 
 void loop() {
-  while (Serial4.available() > 0) {
-    uint8_t incomingByte = Serial4.read();
+  animate_tube_fluid();
 
-    switch (currentState) {
-      
-      case STATE_LOOK_FOR_HEADER_HIGH:
-        if (incomingByte == 0xAB) {
-          packetBuffer[0] = incomingByte;
-          currentState = STATE_LOOK_FOR_HEADER_LOW;
-        }
-        break;
-
-      case STATE_LOOK_FOR_HEADER_LOW:
-        if (incomingByte == 0xCD) {
-          packetBuffer[1] = incomingByte;
-          bytesRead = 2; 
-          currentState = STATE_READ_PAYLOAD;
-        } else {
-          currentState = STATE_LOOK_FOR_HEADER_HIGH;
-        }
-        break;
-
-      case STATE_READ_PAYLOAD:
-        packetBuffer[bytesRead] = incomingByte;
-        bytesRead++;
-
-        if (bytesRead >= sizeof(RichAudioPacket)) {
-          memcpy(&micA, packetBuffer, sizeof(RichAudioPacket));
-
-          uint8_t verifyCheck = micA.masterVolume;
-          for (int i = 0; i < 16; i++) {
-            verifyCheck ^= micA.frequencyBins[i];
-          }
-
-          if (verifyCheck == micA.checksum) {
-            goodPackets++;
-            animate_tube(); 
-          } else {
-            badChecksums++;
-          }
-
-          currentState = STATE_LOOK_FOR_HEADER_HIGH;
-        }
-        break;
-    }
-  }
-
-  // --- RECEIVER TELEMETRY DASHBOARD ---
 #if VERBOSE_DEBUG
   unsigned long currentMillis = millis();
   if (currentMillis - lastPrintTime >= 500) {
     lastPrintTime = currentMillis;
-    Serial.print("[TEENSY MONITOR] Valid Packets: ");
+    Serial.print("[ROLLING ENGINE] Good: ");
     Serial.print(goodPackets);
-    Serial.print(" | Checksum Bad: ");
+    Serial.print(" | Bad CRC: ");
     Serial.print(badChecksums);
-    Serial.print(" | Live Vol: ");
+    Serial.print(" | Vol: ");
     Serial.println(micA.masterVolume);
   }
 #endif
 }
 
-void animate_tube() {
-  fadeToBlackBy(leds, TOTAL_LEDS, 40);
+void animate_tube_fluid() {
+  fadeToBlackBy(leds, TOTAL_LEDS, 35);
   
-  int volumeBars = map(micA.masterVolume, 0, 255, 0, LEDS_PER_STRIP);
-  for(int s=0; s<NUM_STRIPS; s++) {
-    for(int i=0; i<volumeBars; i++) {
-      leds[(s * LEDS_PER_STRIP) + i] = CHSV(160, 240, 200); 
+  uint8_t currentVol = micA.masterVolume;
+  int volumeBars = map(currentVol, 0, 255, 0, LEDS_PER_STRIP);
+  
+  for(int s = 0; s < NUM_STRIPS; s++) {
+    for(int i = 0; i < volumeBars; i++) {
+      leds[(s * LEDS_PER_STRIP) + i] |= CHSV(140 + (currentVol / 4), 240, 200); 
     }
   }
   

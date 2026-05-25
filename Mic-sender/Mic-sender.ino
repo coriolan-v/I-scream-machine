@@ -7,7 +7,7 @@
 #define SAMPLES 64        
 
 // --- COMPILATION FLAGS ---
-#define VERBOSE_DEBUG 0  // Set to 1 for live telemetry, 0 to silence USB output
+#define VERBOSE_DEBUG 1  // Set to 1 for live telemetry, 0 to silence USB output
 
 // Pin Assignments for INMP441 on XIAO RP2040
 #define PIN_SCK      27 
@@ -87,9 +87,13 @@ void loop() {
       FFT.complexToMagnitude();
       
       // 3. Populate frequency bins
+    // Change from 45000 down to a much wider 150000 to prevent clipping
+      packet.masterVolume = constrain(map(rms, 0, 150000, 0, 255), 0, 255);
+
       for (int i = 0; i < 16; i++) {
         double val = vReal[i + 2]; 
-        packet.frequencyBins[i] = constrain(map(val, 0, 900000, 0, 255), 0, 255);
+        // Expand this map ceiling so true scream spikes have room to register
+        packet.frequencyBins[i] = constrain(map(val, 0, 4000000, 0, 255), 0, 255);
       }
       
       // 4. Calculate Checksum
