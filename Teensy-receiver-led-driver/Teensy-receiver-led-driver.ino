@@ -407,7 +407,6 @@ void printPacketDebug() {
   Serial.println(audio.beat);
 }
 
-// Optional slower general visual debug
 void printVisualDebug() {
   if (!VERBOSE) return;
 
@@ -477,10 +476,10 @@ void renderAudioTunnel() {
 
   // Fade if UART data stops
   if (millis() - lastFrameMs > 500) {
-    smVol *= 0.92f;
-    smBass *= 0.92f;
-    smMid *= 0.92f;
-    smTreble *= 0.92f;
+    smVol *= 0.85f;
+    smBass *= 0.85f;
+    smMid *= 0.85f;
+    smTreble *= 0.85f;
   }
 
   for (int s = 0; s < NUM_STRIPS; s++) {
@@ -528,8 +527,11 @@ void renderAudioTunnel() {
         beatGlow * 1.2f +
         sparkle * 0.8f;
 
-      // Idle glow
-      intensity += 0.015f;
+      // True black in silence.
+      // Increase this to 0.06 if you still see tiny noise.
+      if (vol < 0.04f) {
+        intensity = 0.0f;
+      }
 
       intensity = constrain(intensity, 0.0f, 1.0f);
       intensity = powf(intensity, 1.35f);
@@ -541,13 +543,13 @@ void renderAudioTunnel() {
       uint32_t c = hsvToRgb(hue, sat, val);
 
       // Warm bass body
-      if (bass > 0.15f && p < activeLen * 0.55f) {
+      if (bass > 0.15f && p < activeLen * 0.55f && vol >= 0.04f) {
         uint32_t warm = hsvToRgb(15, 240, (uint8_t)(bass * 120));
         c = addColor(c, scaleColor(warm, 0.35f));
       }
 
       // White beat impact
-      if (beatGlow > 0.01f) {
+      if (beatGlow > 0.01f && vol >= 0.04f) {
         c = addColor(c, rgb(
           (uint8_t)(beatGlow * 180),
           (uint8_t)(beatGlow * 180),
@@ -613,6 +615,21 @@ void loop() {
   smMid = smMid * 0.78f + audio.mid * 0.22f;
   smTreble = smTreble * 0.78f + audio.treble * 0.22f;
   smCentroid = smCentroid * 0.85f + audio.centroid * 0.15f;
+
+  // Extra hard silence clamp on Teensy side.
+  if (audio.volume == 0) {
+    smVol *= 0.50f;
+    smBass *= 0.50f;
+    smMid *= 0.50f;
+    smTreble *= 0.50f;
+
+    if (smVol < 3.0f) {
+      smVol = 0.0f;
+      smBass = 0.0f;
+      smMid = 0.0f;
+      smTreble = 0.0f;
+    }
+  }
 
   renderAudioTunnel();
 

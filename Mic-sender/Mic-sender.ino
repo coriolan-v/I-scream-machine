@@ -1,6 +1,8 @@
 /*
   XIAO RP2040 + INMP441 I2S microphone
 
+  Improved for scream / voice detection inside a tube.
+
   I2S pins:
     SCK / BCLK = GPIO27
     WS / LRCLK = GPIO28
@@ -46,7 +48,39 @@
 // ---------- Audio ----------
 static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr uint16_t FFT_SIZE = 256;
-static constexpr float MIC_GAIN = 8.0f;
+
+// Lower gain = less room noise sensitivity.
+// Increase to 4.0 or 5.0 if people need to scream too hard.
+static constexpr float MIC_GAIN = 3.0f;
+
+// ---------- Manual voice gate tuning ----------
+// This is the most important part.
+//
+// If silence still lights LEDs:
+//   increase MANUAL_OPEN_THRESHOLD to 0.12, 0.16, 0.20.
+//
+// If normal shouting does not trigger:
+//   lower MANUAL_OPEN_THRESHOLD to 0.06.
+//
+// Good starting values for a quiet-ish room:
+static constexpr float MANUAL_OPEN_THRESHOLD = 0.120f;
+static constexpr float MANUAL_CLOSE_THRESHOLD = 0.080f;
+
+// Require sustained voice before opening gate.
+// Higher = rejects keyboard clicks better, but slower response.
+static constexpr uint8_t GATE_ATTACK_FRAMES = 6;
+
+// How long gate stays open after the sound drops.
+// Higher = smoother trailing light.
+static constexpr uint8_t GATE_RELEASE_FRAMES = 8;
+
+// Reject events that are mostly sharp high-frequency clicks.
+static constexpr float MAX_TREBLE_TO_VOICE_RATIO = 1.0f;
+
+// How quickly volume grows once gate is open.
+// Lower denominator = louder / longer LED pattern.
+// Try 4.0 for more dramatic, 8.0 for stricter.
+static constexpr float VOLUME_RANGE_MULT = 6.0f;
 
 I2S i2s(INPUT);
 
@@ -55,11 +89,14 @@ double vImag[FFT_SIZE];
 
 ArduinoFFT<double> FFT(vReal, vImag, FFT_SIZE, SAMPLE_RATE);
 
-// ---------- Smoothing ----------
-float noiseFloor = 0.015f;
+// ---------- Detection state ----------
+float smoothVoiceEnergy = 0.0f;
 float smoothVol = 0.0f;
 float prevVol = 0.0f;
-float agc = 1.0f;
+
+bool gateOpen = false;
+uint8_t gateAttackCount = 0;
+uint8_t gateReleaseCount = 0;
 
 uint32_t lastDebugMs = 0;
 uint32_t frameCounter = 0;
@@ -103,7 +140,9 @@ void sendFeatures(
 
 void printDebug(
   float rms,
-  float cleaned,
+  float voiceEnergy,
+  float trebleRatio,
+  bool tooClicky,
   float centroidHz,
   uint8_t vol,
   uint8_t bass,
@@ -124,14 +163,32 @@ void printDebug(
   Serial.print(" rms=");
   Serial.print(rms, 5);
 
-  Serial.print(" noise=");
-  Serial.print(noiseFloor, 5);
+  Serial.print(" voiceEnergy=");
+  Serial.print(voiceEnergy, 5);
 
-  Serial.print(" cleaned=");
-  Serial.print(cleaned, 5);
+  Serial.print(" smoothVoice=");
+  Serial.print(smoothVoiceEnergy, 5);
 
-  Serial.print(" agc=");
-  Serial.print(agc, 2);
+  Serial.print(" openTh=");
+  Serial.print(MANUAL_OPEN_THRESHOLD, 5);
+
+  Serial.print(" closeTh=");
+  Serial.print(MANUAL_CLOSE_THRESHOLD, 5);
+
+  Serial.print(" gate=");
+  Serial.print(gateOpen ? "OPEN" : "closed");
+
+  Serial.print(" atk=");
+  Serial.print(gateAttackCount);
+
+  Serial.print(" rel=");
+  Serial.print(gateReleaseCount);
+
+  Serial.print(" trebleRatio=");
+  Serial.print(trebleRatio, 2);
+
+  Serial.print(" clicky=");
+  Serial.print(tooClicky ? "YES" : "no");
 
   Serial.print(" vol=");
   Serial.print(vol);
@@ -159,11 +216,9 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // UART TX on GPIO0
   Serial1.setTX(PIN_UART_TX);
   Serial1.begin(UART_BAUD);
 
-  // I2S setup
   // With the RP2040 Arduino-Pico I2S library, WS/LRCLK is BCLK + 1.
   // So GPIO27 BCLK and GPIO28 WS is correct.
   i2s.setBCLK(PIN_SCK);
@@ -178,7 +233,7 @@ void setup() {
 
   if (VERBOSE) {
     Serial.println();
-    Serial.println("XIAO RP2040 audio analyser started");
+    Serial.println("XIAO RP2040 scream / voice analyser started");
     Serial.println("I2S:");
     Serial.println("  SCK / BCLK = GPIO27");
     Serial.println("  WS / LRCLK = GPIO28");
@@ -191,6 +246,11 @@ void setup() {
     Serial.println(SAMPLE_RATE);
     Serial.print("FFT size: ");
     Serial.println(FFT_SIZE);
+    Serial.println("Gate:");
+    Serial.print("  Manual open threshold: ");
+    Serial.println(MANUAL_OPEN_THRESHOLD, 5);
+    Serial.print("  Manual close threshold: ");
+    Serial.println(MANUAL_CLOSE_THRESHOLD, 5);
   }
 }
 
@@ -204,9 +264,9 @@ void loop() {
     i2s.read32(&left, &right);
 
     // INMP441 channel depends on L/R pin.
-    // If you get silence, change this to:
-    // int32_t raw = right;
+    // If you get silence, swap to right:
     int32_t raw = left;
+    // int32_t raw = right;
 
     // INMP441 24-bit data is usually left-aligned in a 32-bit word.
     float sample = (float)(raw >> 8) / 8388608.0f;
@@ -228,33 +288,16 @@ void loop() {
 
   float rms = sqrtf(sumSq / FFT_SIZE);
 
-  // Adaptive noise floor
-  if (rms < noiseFloor * 1.5f) {
-    noiseFloor = noiseFloor * 0.995f + rms * 0.005f;
-  }
-
-  float cleaned = max(0.0f, rms - noiseFloor);
-
-  // Simple AGC
-  float target = 0.12f;
-
-  if (cleaned > 0.0001f) {
-    float desiredAgc = target / cleaned;
-    desiredAgc = constrain(desiredAgc, 0.8f, 80.0f);
-    agc = agc * 0.995f + desiredAgc * 0.005f;
-  }
-
-  float normVol = constrain(cleaned * agc, 0.0f, 1.0f);
-  smoothVol = smoothVol * 0.80f + normVol * 0.20f;
-
   FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
   FFT.compute(FFTDirection::Forward);
   FFT.complexToMagnitude();
 
-  float bassE = 0;
-  float midE = 0;
-  float trebleE = 0;
-  float totalE = 0;
+  float lowVoiceE = 0;
+  float midVoiceE = 0;
+  float highVoiceE = 0;
+  float trebleClickE = 0;
+
+  float totalVoiceE = 0;
   float weightedFreq = 0;
 
   for (uint16_t bin = 1; bin < FFT_SIZE / 2; bin++) {
@@ -263,35 +306,125 @@ void loop() {
 
     if (mag < 0.001f) continue;
 
-    if (freq >= 80 && freq < 350) {
-      bassE += mag;
-    } else if (freq >= 350 && freq < 1800) {
-      midE += mag;
-    } else if (freq >= 1800 && freq < 5500) {
-      trebleE += mag;
+    // Voice / scream useful range.
+    // Low voice / body: 120-350 Hz
+    // Main voice:       350-1600 Hz
+    // Harsh scream:     1600-3500 Hz
+    // Click rejection:  3500-6500 Hz
+    if (freq >= 120 && freq < 350) {
+      lowVoiceE += mag;
+    } else if (freq >= 350 && freq < 1600) {
+      midVoiceE += mag;
+    } else if (freq >= 1600 && freq < 3500) {
+      highVoiceE += mag;
+    } else if (freq >= 3500 && freq < 6500) {
+      trebleClickE += mag;
     }
 
-    if (freq >= 80 && freq < 5500) {
-      totalE += mag;
+    if (freq >= 120 && freq < 3500) {
+      totalVoiceE += mag;
       weightedFreq += mag * freq;
     }
   }
 
-  float centroidHz = totalE > 0 ? weightedFreq / totalE : 0;
+  // Weighted voice energy.
+  // Mid band is strongest for voice.
+  // High band catches screaming.
+  float voiceEnergy =
+    lowVoiceE * 0.60f +
+    midVoiceE * 1.00f +
+    highVoiceE * 0.80f;
 
-  float bandGain = 0.0035f * agc;
+  // Reject short sharp events.
+  float trebleRatio = trebleClickE / max(voiceEnergy, 0.0001f);
+  bool tooClicky = trebleRatio > MAX_TREBLE_TO_VOICE_RATIO;
 
-  uint8_t bass = clampByte(constrain(bassE * bandGain, 0.0f, 1.0f) * 255);
-  uint8_t mid = clampByte(constrain(midE * bandGain * 0.55f, 0.0f, 1.0f) * 255);
-  uint8_t treble = clampByte(constrain(trebleE * bandGain * 0.90f, 0.0f, 1.0f) * 255);
+  // Smooth energy.
+  // This helps ignore instantaneous keyboard clicks.
+  smoothVoiceEnergy = smoothVoiceEnergy * 0.72f + voiceEnergy * 0.28f;
 
-  float cNorm = (centroidHz - 100.0f) / (5000.0f - 100.0f);
-  uint8_t centroid = clampByte(constrain(cNorm, 0.0f, 1.0f) * 255);
+  bool wantsOpen = smoothVoiceEnergy > MANUAL_OPEN_THRESHOLD && !tooClicky;
+  bool wantsClose = smoothVoiceEnergy < MANUAL_CLOSE_THRESHOLD || tooClicky;
 
-  bool isBeat = smoothVol > 0.16f && smoothVol > prevVol * 1.45f;
-  prevVol = prevVol * 0.92f + smoothVol * 0.08f;
+  if (!gateOpen) {
+    if (wantsOpen) {
+      gateAttackCount++;
 
-  uint8_t vol = clampByte(powf(smoothVol, 0.55f) * 255.0f);
+      if (gateAttackCount >= GATE_ATTACK_FRAMES) {
+        gateOpen = true;
+        gateReleaseCount = GATE_RELEASE_FRAMES;
+      }
+    } else {
+      gateAttackCount = 0;
+    }
+  } else {
+    if (wantsClose) {
+      if (gateReleaseCount > 0) {
+        gateReleaseCount--;
+      } else {
+        gateOpen = false;
+        gateAttackCount = 0;
+      }
+    } else {
+      gateReleaseCount = GATE_RELEASE_FRAMES;
+    }
+  }
+
+  float centroidHz = totalVoiceE > 0 ? weightedFreq / totalVoiceE : 0;
+
+  float normVol = 0.0f;
+
+  if (gateOpen) {
+    // Dead-zone: nothing happens until clearly above open threshold.
+    float over =
+      (smoothVoiceEnergy - MANUAL_OPEN_THRESHOLD) /
+      max(MANUAL_OPEN_THRESHOLD * VOLUME_RANGE_MULT, 0.001f);
+
+    normVol = constrain(over, 0.0f, 1.0f);
+
+    // Less sensitive than before.
+    // Louder voices grow the pattern.
+    normVol = powf(normVol, 0.85f);
+  }
+
+  // Smooth output.
+  // Fast attack, slower release.
+  if (normVol > smoothVol) {
+    smoothVol = smoothVol * 0.45f + normVol * 0.55f;
+  } else {
+    smoothVol = smoothVol * 0.82f + normVol * 0.18f;
+  }
+
+  // If gate is closed, force true black quickly.
+  if (!gateOpen) {
+    smoothVol *= 0.40f;
+    if (smoothVol < 0.020f) {
+      smoothVol = 0.0f;
+    }
+  }
+
+  uint8_t bass = 0;
+  uint8_t mid = 0;
+  uint8_t treble = 0;
+  uint8_t centroid = 0;
+
+  if (gateOpen) {
+    // Manual scaling of band brightness.
+    // If colour/pattern feels too weak while volume works, increase this.
+    float bandScale = 0.020f;
+
+    bass = clampByte(constrain(lowVoiceE * bandScale, 0.0f, 1.0f) * 255);
+    mid = clampByte(constrain(midVoiceE * bandScale * 0.75f, 0.0f, 1.0f) * 255);
+    treble = clampByte(constrain(highVoiceE * bandScale * 0.85f, 0.0f, 1.0f) * 255);
+
+    float cNorm = (centroidHz - 120.0f) / (3500.0f - 120.0f);
+    centroid = clampByte(constrain(cNorm, 0.0f, 1.0f) * 255);
+  }
+
+  bool isBeat = gateOpen && smoothVol > 0.20f && smoothVol > prevVol * 1.35f;
+  prevVol = prevVol * 0.90f + smoothVol * 0.10f;
+
+  uint8_t vol = clampByte(smoothVol * 255.0f);
   uint8_t beat = isBeat ? 255 : 0;
 
   sendFeatures(
@@ -307,7 +440,9 @@ void loop() {
 
   printDebug(
     rms,
-    cleaned,
+    voiceEnergy,
+    trebleRatio,
+    tooClicky,
     centroidHz,
     vol,
     bass,
