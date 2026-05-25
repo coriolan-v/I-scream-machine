@@ -22,6 +22,18 @@
     Teensy pin 11 -> LED strip 11 data
 
   12 strips, 192 LEDs each.
+
+  Incoming frame:
+    volume, bass, mid, treble, noteHue, beat
+
+  noteHue is produced by XIAO:
+    Do  -> red
+    Re  -> orange
+    Mi  -> yellow
+    Fa  -> green
+    Sol -> cyan
+    La  -> blue
+    Si  -> violet
 */
 
 #include <Arduino.h>
@@ -67,7 +79,7 @@ struct AudioFrame {
   uint8_t bass = 0;
   uint8_t mid = 0;
   uint8_t treble = 0;
-  uint8_t centroid = 0;
+  uint8_t noteHue = 0;
   uint8_t beat = 0;
 };
 
@@ -89,7 +101,7 @@ float smVol = 0;
 float smBass = 0;
 float smMid = 0;
 float smTreble = 0;
-float smCentroid = 0;
+float smNoteHue = 0;
 
 float beatPulse = 0;
 float flow = 0;
@@ -241,7 +253,7 @@ bool readAudioFrame() {
           audio.bass = buf[3];
           audio.mid = buf[4];
           audio.treble = buf[5];
-          audio.centroid = buf[6];
+          audio.noteHue = buf[6];
           audio.beat = buf[7];
 
           lastFrameMs = millis();
@@ -400,8 +412,8 @@ void printPacketDebug() {
   Serial.print(" treble=");
   Serial.print(audio.treble);
 
-  Serial.print(" centroid=");
-  Serial.print(audio.centroid);
+  Serial.print(" noteHue=");
+  Serial.print(audio.noteHue);
 
   Serial.print(" beat=");
   Serial.println(audio.beat);
@@ -430,8 +442,8 @@ void printVisualDebug() {
   Serial.print(" smTreble=");
   Serial.print(smTreble, 1);
 
-  Serial.print(" smCentroid=");
-  Serial.print(smCentroid, 1);
+  Serial.print(" smNoteHue=");
+  Serial.print(smNoteHue, 1);
 
   Serial.print(" beatPulse=");
   Serial.print(beatPulse, 2);
@@ -446,10 +458,10 @@ void renderAudioTunnel() {
   float bass = smBass / 255.0f;
   float mid = smMid / 255.0f;
   float treble = smTreble / 255.0f;
-  float centroid = smCentroid / 255.0f;
 
-  // Frequency -> hue
-  uint8_t baseHue = (uint8_t)(centroid * 185.0f + 5.0f);
+  // noteHue is now musical note colour from XIAO:
+  // Do=red, Re=orange, Mi=yellow, Fa=green, Sol=cyan, La=blue, Si=violet.
+  uint8_t baseHue = (uint8_t)smNoteHue;
 
   // Loudness controls how far the pattern grows along the strip
   float activeLen = 8.0f + powf(vol, 0.65f) * (LEDS_PER_STRIP - 8);
@@ -528,7 +540,6 @@ void renderAudioTunnel() {
         sparkle * 0.8f;
 
       // True black in silence.
-      // Increase this to 0.06 if you still see tiny noise.
       if (vol < 0.04f) {
         intensity = 0.0f;
       }
@@ -536,15 +547,18 @@ void renderAudioTunnel() {
       intensity = constrain(intensity, 0.0f, 1.0f);
       intensity = powf(intensity, 1.35f);
 
-      uint8_t hue = baseHue + s * 5 + p * 0.10f + sideBias * 18.0f;
-      uint8_t sat = 230;
+      // Small hue offsets make the tube feel alive,
+      // but keep note identity mostly visible.
+      uint8_t hue = baseHue + s * 2 + p * 0.03f + sideBias * 6.0f;
+
+      uint8_t sat = 235;
       uint8_t val = (uint8_t)(intensity * 255.0f);
 
       uint32_t c = hsvToRgb(hue, sat, val);
 
       // Warm bass body
       if (bass > 0.15f && p < activeLen * 0.55f && vol >= 0.04f) {
-        uint32_t warm = hsvToRgb(15, 240, (uint8_t)(bass * 120));
+        uint32_t warm = hsvToRgb(baseHue, 240, (uint8_t)(bass * 120));
         c = addColor(c, scaleColor(warm, 0.35f));
       }
 
@@ -598,6 +612,9 @@ void setup() {
       Serial.print(" -> Teensy pin ");
       Serial.println(pinList[s]);
     }
+
+    Serial.println("Colour mapping from XIAO:");
+    Serial.println("  Do=red, Re=orange, Mi=yellow, Fa=green, Sol=cyan, La=blue, Si=violet");
   }
 
   startupLedTest();
@@ -614,7 +631,7 @@ void loop() {
   smBass = smBass * 0.78f + audio.bass * 0.22f;
   smMid = smMid * 0.78f + audio.mid * 0.22f;
   smTreble = smTreble * 0.78f + audio.treble * 0.22f;
-  smCentroid = smCentroid * 0.85f + audio.centroid * 0.15f;
+  smNoteHue = smNoteHue * 0.85f + audio.noteHue * 0.15f;
 
   // Extra hard silence clamp on Teensy side.
   if (audio.volume == 0) {
