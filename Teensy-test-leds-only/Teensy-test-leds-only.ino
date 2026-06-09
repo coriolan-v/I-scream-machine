@@ -18,7 +18,7 @@
 
 // Any group of digital pins may be used
 const int numPins = 12;
-byte pinList[numPins] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+byte pinList[numPins] = {33, 34, 35, 36, 37, 38, 39, 40, 17, 18, 19, 20};
 
 const int ledsPerStrip = 120;
 

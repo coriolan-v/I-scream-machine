@@ -1,43 +1,22 @@
 /*
-  Teensy 4.1 LED renderer
+  Teensy 4.1 LED renderer (Dual Mic Audio Tunnel)
 
-  Receives compact audio frames from XIAO RP2040 over Serial4.
+  Receives compact audio frames from TWO XIAO RP2040s over designated UARTs.
 
-  UART wiring:
-    XIAO GPIO0 / TX  -> Teensy 4.1 pin 16 / Serial4 RX
-    XIAO GND         -> Teensy GND
-
-  LED wiring:
-    Teensy pin 0  -> LED strip 0 data
-    Teensy pin 1  -> LED strip 1 data
-    Teensy pin 2  -> LED strip 2 data
-    Teensy pin 3  -> LED strip 3 data
-    Teensy pin 4  -> LED strip 4 data
-    Teensy pin 5  -> LED strip 5 data
-    Teensy pin 6  -> LED strip 6 data
-    Teensy pin 7  -> LED strip 7 data
-    Teensy pin 8  -> LED strip 8 data
-    Teensy pin 9  -> LED strip 9 data
-    Teensy pin 10 -> LED strip 10 data
-    Teensy pin 11 -> LED strip 11 data
-
-  12 strips, 192 LEDs each.
-
-  Incoming frame:
-    volume, bass, mid, treble, noteHue, beat
-
-  noteHue is produced by XIAO:
-    Do  -> red
-    Re  -> orange
-    Mi  -> yellow
-    Fa  -> green
-    Sol -> cyan
-    La  -> blue
-    Si  -> violet
+  Suggested Hardware UART Wiring Options for Teensy 4.1:
+    Mic 1 TX -> Teensy Pin 16 (Serial4 RX) -> Default
+    Mic 2 TX -> Teensy Pin 0  (Serial1 RX) -> Default
+    GNDs     -> Common Teensy GND
 */
 
 #include <Arduino.h>
 #include <OctoWS2811.h>
+
+// ---------- Dual UART Configuration ----------
+#define MIC1_SERIAL Serial7   // Choose UART for Mic 1 (Drives LEDs 0 -> 95)
+#define MIC2_SERIAL Serial2   // Choose UART for Mic 2 (Drives LEDs 191 -> 96)
+
+#define MIC1_SERIAL_RTS 27
 
 // ---------- Debug ----------
 #define VERBOSE true
@@ -47,16 +26,13 @@
 // ---------- LEDs ----------
 static constexpr int NUM_STRIPS = 12;
 static constexpr int LEDS_PER_STRIP = 192;
+static constexpr int HALF_LEDS = LEDS_PER_STRIP / 2; // 96 LEDs per segment
 static constexpr int NUM_LEDS = NUM_STRIPS * LEDS_PER_STRIP;
 
 static constexpr uint32_t UART_BAUD = 460800;
 
-// Your requested Teensy LED pins
-byte pinList[NUM_STRIPS] = {
-  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
-};
-
-// OctoWS2811 memory sizing using PJRC generic formula
+// Teensy LED pins
+byte pinList[NUM_STRIPS] = {33, 34, 35, 36, 37, 38, 39, 40, 17, 18, 19, 20};
 const int bytesPerLED = 3;
 
 DMAMEM int displayMemory[LEDS_PER_STRIP * NUM_STRIPS * bytesPerLED / 4];
@@ -73,7 +49,7 @@ OctoWS2811 leds(
   pinList
 );
 
-// ---------- Received audio state ----------
+// ---------- Audio Frame Struct ----------
 struct AudioFrame {
   uint8_t volume = 0;
   uint8_t bass = 0;
@@ -83,27 +59,32 @@ struct AudioFrame {
   uint8_t beat = 0;
 };
 
-AudioFrame audio;
+// ---------- Dual Engine Processing State ----------
+struct MicEngine {
+  AudioFrame audio;
+  uint32_t lastFrameMs = 0;
+  uint32_t frameCounter = 0;
+  uint32_t badChecksumCounter = 0;
+  uint32_t rawByteCounter = 0;
 
-uint32_t lastFrameMs = 0;
-uint32_t frameCounter = 0;
-uint32_t badChecksumCounter = 0;
-uint32_t rawByteCounter = 0;
+  // UART parser state machine tracking
+  uint8_t state = 0;
+  uint8_t buf[8];
+  uint8_t idx = 0;
 
-uint32_t lastDebugMs = 0;
-uint32_t lastPacketDebugMs = 0;
-uint32_t lastPacketCount = 0;
-uint32_t lastBadChecksumCount = 0;
-uint32_t lastRawByteCount = 0;
+  // Visual Smoothing
+  float smVol = 0;
+  float smBass = 0;
+  float smMid = 0;
+  float smTreble = 0;
+  float smNoteHue = 0;
+  float beatPulse = 0;
+};
 
-// ---------- Visual state ----------
-float smVol = 0;
-float smBass = 0;
-float smMid = 0;
-float smTreble = 0;
-float smNoteHue = 0;
+MicEngine mic1;
+MicEngine mic2;
 
-float beatPulse = 0;
+// ---------- Global Visual State ----------
 float flow = 0;
 
 // ---------- Helpers ----------
@@ -132,149 +113,79 @@ void fillAll(uint32_t color) {
 void startupLedTest() {
   if (VERBOSE) Serial.println("Startup LED test: all red");
   fillAll(rgb(255, 0, 0));
-  delay(700);
+  delay(500);
 
   if (VERBOSE) Serial.println("Startup LED test: all green");
   fillAll(rgb(0, 255, 0));
-  delay(700);
+  delay(500);
 
   if (VERBOSE) Serial.println("Startup LED test: all blue");
   fillAll(rgb(0, 0, 255));
-  delay(700);
-
-  if (VERBOSE) Serial.println("Startup LED test: all white, low brightness");
-  fillAll(rgb(40, 40, 40));
-  delay(700);
-
-  if (VERBOSE) Serial.println("Startup LED test: per-strip test");
+  delay(500);
 
   fillAll(rgb(0, 0, 0));
-  delay(200);
-
-  for (int s = 0; s < NUM_STRIPS; s++) {
-    fillAll(rgb(0, 0, 0));
-
-    uint32_t c;
-
-    if (s % 3 == 0) {
-      c = rgb(255, 0, 0);
-    } else if (s % 3 == 1) {
-      c = rgb(0, 255, 0);
-    } else {
-      c = rgb(0, 0, 255);
-    }
-
-    for (int p = 0; p < LEDS_PER_STRIP; p++) {
-      leds.setPixel(ledIndex(s, p), c);
-    }
-
-    leds.show();
-
-    if (VERBOSE) {
-      Serial.print("Testing strip ");
-      Serial.print(s);
-      Serial.print(" on Teensy pin ");
-      Serial.println(pinList[s]);
-    }
-
-    delay(300);
-  }
-
-  if (VERBOSE) Serial.println("Startup LED test: pixel chase across all strips");
-
-  fillAll(rgb(0, 0, 0));
-
-  for (int p = 0; p < LEDS_PER_STRIP; p += 4) {
-    fillAll(rgb(0, 0, 0));
-
-    for (int s = 0; s < NUM_STRIPS; s++) {
-      leds.setPixel(ledIndex(s, p), rgb(255, 255, 255));
-
-      if (p + 1 < LEDS_PER_STRIP) {
-        leds.setPixel(ledIndex(s, p + 1), rgb(80, 80, 80));
-      }
-
-      if (p + 2 < LEDS_PER_STRIP) {
-        leds.setPixel(ledIndex(s, p + 2), rgb(30, 30, 30));
-      }
-    }
-
-    leds.show();
-    delay(25);
-  }
-
-  fillAll(rgb(0, 0, 0));
-
-  if (VERBOSE) Serial.println("Startup LED test complete. Entering audio mode.");
+  delay(100);
 }
 
-// ---------- UART receive ----------
-bool readAudioFrame() {
-  static uint8_t state = 0;
-  static uint8_t buf[8];
-  static uint8_t idx = 0;
+// ---------- Dual UART Parsers ----------
+bool readAudioFrame(HardwareSerial &serialPort, MicEngine &mic) {
+  while (serialPort.available()) {
+    uint8_t b = serialPort.read();
+    mic.rawByteCounter++;
 
-  while (Serial4.available()) {
-    uint8_t b = Serial4.read();
-    rawByteCounter++;
-
-    switch (state) {
+    switch (mic.state) {
       case 0:
         if (b == 0xAA) {
-          state = 1;
+          mic.state = 1;
         }
         break;
 
       case 1:
         if (b == 0x55) {
-          buf[0] = 0xAA;
-          buf[1] = 0x55;
-          idx = 2;
-          state = 2;
+          mic.buf[0] = 0xAA;
+          mic.buf[1] = 0x55;
+          mic.idx = 2;
+          mic.state = 2;
         } else {
-          state = 0;
+          mic.state = 0;
         }
         break;
 
       case 2:
-        buf[idx++] = b;
-
-        if (idx >= 8) {
-          state = 3;
+        mic.buf[mic.idx++] = b;
+        if (mic.idx >= 8) {
+          mic.state = 3;
         }
-
         break;
 
       case 3: {
-        uint8_t expected = checksumFrame(buf, 8);
+        uint8_t expected = checksumFrame(mic.buf, 8);
 
         if (b == expected) {
-          audio.volume = buf[2];
-          audio.bass = buf[3];
-          audio.mid = buf[4];
-          audio.treble = buf[5];
-          audio.noteHue = buf[6];
-          audio.beat = buf[7];
+          mic.audio.volume  = mic.buf[2];
+          mic.audio.bass    = mic.buf[3];
+          mic.audio.mid     = mic.buf[4];
+          mic.audio.treble  = mic.buf[5];
+          mic.audio.noteHue = mic.buf[6];
+          mic.audio.beat    = mic.buf[7];
 
-          lastFrameMs = millis();
-          frameCounter++;
+          mic.lastFrameMs = millis();
+          mic.frameCounter++;
 
-          state = 0;
+          mic.state = 0;
           return true;
         } else {
-          badChecksumCounter++;
-          state = 0;
+          mic.badChecksumCounter++;
+          mic.state = 0;
         }
-
         break;
       }
     }
   }
-
   return false;
 }
 
-// ---------- Colour ----------
+// ---------- Colour Math Utilities ----------
 uint32_t hsvToRgb(uint8_t h, uint8_t s, uint8_t v) {
   uint8_t region = h / 43;
   uint8_t remainder = (h - region * 43) * 6;
@@ -284,374 +195,214 @@ uint32_t hsvToRgb(uint8_t h, uint8_t s, uint8_t v) {
   uint8_t t = (v * (255 - ((s * (255 - remainder)) >> 8))) >> 8;
 
   switch (region) {
-    case 0:
-      return rgb(v, t, p);
-
-    case 1:
-      return rgb(q, v, p);
-
-    case 2:
-      return rgb(p, v, t);
-
-    case 3:
-      return rgb(p, q, v);
-
-    case 4:
-      return rgb(t, p, v);
-
-    default:
-      return rgb(v, p, q);
+    case 0:  return rgb(v, t, p);
+    case 1:  return rgb(q, v, p);
+    case 2:  return rgb(p, v, t);
+    case 3:  return rgb(p, q, v);
+    case 4:  return rgb(t, p, v);
+    default: return rgb(v, p, q);
   }
 }
 
 uint32_t scaleColor(uint32_t c, float scale) {
   scale = constrain(scale, 0.0f, 1.0f);
-
   uint8_t r = ((c >> 16) & 0xFF) * scale;
   uint8_t g = ((c >> 8) & 0xFF) * scale;
   uint8_t b = (c & 0xFF) * scale;
-
   return rgb(r, g, b);
 }
 
 uint32_t addColor(uint32_t a, uint32_t b) {
-  uint16_t ar = (a >> 16) & 0xFF;
-  uint16_t ag = (a >> 8) & 0xFF;
-  uint16_t ab = a & 0xFF;
-
-  uint16_t br = (b >> 16) & 0xFF;
-  uint16_t bg = (b >> 8) & 0xFF;
-  uint16_t bb = b & 0xFF;
-
-  return rgb(
-    min(255, ar + br),
-    min(255, ag + bg),
-    min(255, ab + bb)
-  );
+  uint16_t ar = (a >> 16) & 0xFF; uint16_t ag = (a >> 8) & 0xFF; uint16_t ab = a & 0xFF;
+  uint16_t br = (b >> 16) & 0xFF; uint16_t bg = (b >> 8) & 0xFF; uint16_t bb = b & 0xFF;
+  return rgb(min(255, ar + br), min(255, ag + bg), min(255, ab + bb));
 }
 
-// ---------- Debug ----------
-void printPacketDebug() {
-  if (!VERBOSE) return;
+// ---------- Render Engine Segment ----------
+// targetPixel is the clean sequential layout (0 to 95)
+// outputPixel maps it dynamically to physical layouts
+void processPixelPattern(int strip, int targetPixel, int outputPixel, MicEngine &mic, float sideBias, float speedModifier) {
+  float vol = mic.smVol / 255.0f;
+  float bass = mic.smBass / 255.0f;
+  float mid = mic.smMid / 255.0f;
+  float treble = mic.smTreble / 255.0f;
+  uint8_t baseHue = (uint8_t)mic.smNoteHue;
 
-  uint32_t now = millis();
+  float x = (float)targetPixel;
 
-  if (now - lastPacketDebugMs < PACKET_DEBUG_INTERVAL_MS) {
-    return;
-  }
-
-  float dt;
-
-  if (lastPacketDebugMs == 0) {
-    dt = PACKET_DEBUG_INTERVAL_MS / 1000.0f;
-  } else {
-    dt = (now - lastPacketDebugMs) / 1000.0f;
-  }
-
-  if (dt <= 0) {
-    dt = 1.0f;
-  }
-
-  uint32_t packetsNow = frameCounter;
-  uint32_t badNow = badChecksumCounter;
-  uint32_t bytesNow = rawByteCounter;
-
-  uint32_t packetsDelta = packetsNow - lastPacketCount;
-  uint32_t badDelta = badNow - lastBadChecksumCount;
-  uint32_t bytesDelta = bytesNow - lastRawByteCount;
-
-  lastPacketDebugMs = now;
-  lastPacketCount = packetsNow;
-  lastBadChecksumCount = badNow;
-  lastRawByteCount = bytesNow;
-
-  Serial.print("[UART] packets=");
-  Serial.print(packetsNow);
-
-  Serial.print(" +");
-  Serial.print(packetsDelta);
-
-  Serial.print(" pkt/s=");
-  Serial.print(packetsDelta / dt, 1);
-
-  Serial.print(" bytes=");
-  Serial.print(bytesNow);
-
-  Serial.print(" +");
-  Serial.print(bytesDelta);
-
-  Serial.print(" B/s=");
-  Serial.print(bytesDelta / dt, 1);
-
-  Serial.print(" badChecksum=");
-  Serial.print(badNow);
-
-  Serial.print(" +");
-  Serial.print(badDelta);
-
-  Serial.print(" ageMs=");
-
-  if (lastFrameMs == 0) {
-    Serial.print("NO_FRAME_YET");
-  } else {
-    Serial.print(now - lastFrameMs);
-  }
-
-  Serial.print(" Serial4.available=");
-  Serial.print(Serial4.available());
-
-  Serial.print(" last: vol=");
-  Serial.print(audio.volume);
-
-  Serial.print(" bass=");
-  Serial.print(audio.bass);
-
-  Serial.print(" mid=");
-  Serial.print(audio.mid);
-
-  Serial.print(" treble=");
-  Serial.print(audio.treble);
-
-  Serial.print(" noteHue=");
-  Serial.print(audio.noteHue);
-
-  Serial.print(" beat=");
-  Serial.println(audio.beat);
-}
-
-void printVisualDebug() {
-  if (!VERBOSE) return;
-
-  uint32_t now = millis();
-
-  if (now - lastDebugMs < DEBUG_INTERVAL_MS) {
-    return;
-  }
-
-  lastDebugMs = now;
-
-  Serial.print("[VIS] smVol=");
-  Serial.print(smVol, 1);
-
-  Serial.print(" smBass=");
-  Serial.print(smBass, 1);
-
-  Serial.print(" smMid=");
-  Serial.print(smMid, 1);
-
-  Serial.print(" smTreble=");
-  Serial.print(smTreble, 1);
-
-  Serial.print(" smNoteHue=");
-  Serial.print(smNoteHue, 1);
-
-  Serial.print(" beatPulse=");
-  Serial.print(beatPulse, 2);
-
-  Serial.print(" flow=");
-  Serial.println(flow, 1);
-}
-
-// ---------- Main visual ----------
-void renderAudioTunnel() {
-  float vol = smVol / 255.0f;
-  float bass = smBass / 255.0f;
-  float mid = smMid / 255.0f;
-  float treble = smTreble / 255.0f;
-
-  // noteHue is now musical note colour from XIAO:
-  // Do=red, Re=orange, Mi=yellow, Fa=green, Sol=cyan, La=blue, Si=violet.
-  uint8_t baseHue = (uint8_t)smNoteHue;
-
-  // Loudness controls how far the pattern grows along the strip
-  float activeLen = 8.0f + powf(vol, 0.65f) * (LEDS_PER_STRIP - 8);
-
-  // Bass makes larger wave packets
-  float waveWidth = 8.0f + bass * 30.0f;
-
-  // Treble adds sparkle
+  // Render variables relative to half lengths
+  float activeLen = 4.0f + powf(vol, 0.65f) * (HALF_LEDS - 4);
+  float waveWidth = 4.0f + bass * 15.0f;
   float sparkleAmount = treble;
 
-  // Flow speed
-  flow += 0.35f + mid * 2.3f + bass * 0.8f;
+  // Main growing bar
+  float edge = activeLen - x;
+  float bar = constrain(edge / 9.0f, 0.0f, 1.0f);
 
-  if (flow > 100000.0f) {
-    flow = 0;
+  // Moving waves
+  float wavePos = fmodf(flow * speedModifier + strip * 13.0f, HALF_LEDS + waveWidth * 2.0f) - waveWidth;
+  float d = fabsf(x - wavePos);
+  float wave = max(0.0f, 1.0f - d / waveWidth);
+  wave = wave * wave;
+
+  float wavePos2 = HALF_LEDS - wavePos;
+  float d2 = fabsf(x - wavePos2);
+  float wave2 = max(0.0f, 1.0f - d2 / (waveWidth * 1.4f));
+  wave2 = wave2 * wave2 * 0.6f;
+
+  // Beat pulse front
+  float beatPos = (1.0f - mic.beatPulse) * HALF_LEDS;
+  float beatD = fabsf(x - beatPos);
+  float beatGlow = max(0.0f, 1.0f - beatD / 10.0f) * mic.beatPulse;
+
+  // Sparkle generator
+  uint32_t hash = (uint32_t)(outputPixel * 1103515245UL + strip * 12345UL + (uint32_t)(flow * 17));
+  float sparkle = ((hash >> 24) & 0xFF) / 255.0f;
+  if (sparkle > (0.985f - sparkleAmount * 0.06f)) {
+    sparkle = sparkleAmount;
+  } else {
+    sparkle = 0.0f;
   }
 
-  // Beat pulse
-  beatPulse *= 0.88f;
+  float intensity = bar * 0.70f + wave * (0.25f + mid * 0.45f) + wave2 * 0.25f + beatGlow * 1.2f + sparkle * 0.8f;
 
-  if (audio.beat > 0) {
-    beatPulse = 1.0f;
+  if (vol < 0.04f) {
+    intensity = 0.0f;
   }
 
-  // Fade if UART data stops
-  if (millis() - lastFrameMs > 500) {
-    smVol *= 0.85f;
-    smBass *= 0.85f;
-    smMid *= 0.85f;
-    smTreble *= 0.85f;
+  intensity = constrain(intensity, 0.0f, 1.0f);
+  intensity = powf(intensity, 1.35f);
+
+  uint8_t hue = baseHue + strip * 2 + targetPixel * 0.06f + sideBias * 6.0f;
+  uint8_t sat = 235;
+  uint8_t val = (uint8_t)(intensity * 255.0f);
+
+  uint32_t c = hsvToRgb(hue, sat, val);
+
+  // Warm bass body
+  if (bass > 0.15f && x < activeLen * 0.55f && vol >= 0.04f) {
+    uint32_t warm = hsvToRgb(baseHue, 240, (uint8_t)(bass * 120));
+    c = addColor(c, scaleColor(warm, 0.35f));
+  }
+
+  // White beat impact
+  if (beatGlow > 0.01f && vol >= 0.04f) {
+    c = addColor(c, rgb((uint8_t)(beatGlow * 180), (uint8_t)(beatGlow * 180), (uint8_t)(beatGlow * 180)));
+  }
+
+  leds.setPixel(ledIndex(strip, outputPixel), c);
+}
+
+// ---------- Render Audio Tunnel Loops ----------
+void renderAudioTunnel() {
+  // Drive mutual flow variables using both engine variations
+  float midAvg = (mic1.smMid + mic2.smMid) / 510.0f;
+  float bassAvg = (mic1.smBass + mic2.smBass) / 510.0f;
+  flow += 0.35f + midAvg * 2.3f + bassAvg * 0.8f;
+
+  if (flow > 100000.0f) flow = 0;
+
+  // Manage individual beat triggers
+  mic1.beatPulse *= 0.88f;
+  if (mic1.audio.beat > 0) mic1.beatPulse = 1.0f;
+
+  mic2.beatPulse *= 0.88f;
+  if (mic2.audio.beat > 0) mic2.beatPulse = 1.0f;
+
+  // Watchdog watchdog data loss safety timeouts
+  uint32_t currentMs = millis();
+  if (currentMs - mic1.lastFrameMs > 500) {
+    mic1.smVol *= 0.85f; mic1.smBass *= 0.85f; mic1.smMid *= 0.85f; mic1.smTreble *= 0.85f;
+  }
+  if (currentMs - mic2.lastFrameMs > 500) {
+    mic2.smVol *= 0.85f; mic2.smBass *= 0.85f; mic2.smMid *= 0.85f; mic2.smTreble *= 0.85f;
   }
 
   for (int s = 0; s < NUM_STRIPS; s++) {
     float stripPhase = (float)s / NUM_STRIPS;
     float sideBias = sinf(stripPhase * TWO_PI + flow * 0.015f) * 0.5f + 0.5f;
 
-    for (int p = 0; p < LEDS_PER_STRIP; p++) {
-      float x = (float)p;
+    // Loop through individual channel zones
+    for (int p = 0; p < HALF_LEDS; p++) {
+      // --- Mic 1 Processing Block: LEDs 0 to 95 ---
+      processPixelPattern(s, p, p, mic1, sideBias, 1.0f);
 
-      // Main growing bar
-      float edge = activeLen - x;
-      float bar = constrain(edge / 18.0f, 0.0f, 1.0f);
-
-      // Moving wave
-      float wavePos = fmodf(flow + s * 13.0f, LEDS_PER_STRIP + waveWidth * 2.0f) - waveWidth;
-      float d = fabsf(x - wavePos);
-      float wave = max(0.0f, 1.0f - d / waveWidth);
-      wave = wave * wave;
-
-      // Reverse wave
-      float wavePos2 = LEDS_PER_STRIP - wavePos;
-      float d2 = fabsf(x - wavePos2);
-      float wave2 = max(0.0f, 1.0f - d2 / (waveWidth * 1.4f));
-      wave2 = wave2 * wave2 * 0.6f;
-
-      // Beat pulse front
-      float beatPos = (1.0f - beatPulse) * LEDS_PER_STRIP;
-      float beatD = fabsf(x - beatPos);
-      float beatGlow = max(0.0f, 1.0f - beatD / 20.0f) * beatPulse;
-
-      // Deterministic pseudo-random sparkle
-      uint32_t hash = (uint32_t)(p * 1103515245UL + s * 12345UL + (uint32_t)(flow * 17));
-      float sparkle = ((hash >> 24) & 0xFF) / 255.0f;
-
-      if (sparkle > (0.985f - sparkleAmount * 0.06f)) {
-        sparkle = sparkleAmount;
-      } else {
-        sparkle = 0.0f;
-      }
-
-      float intensity =
-        bar * 0.70f +
-        wave * (0.25f + mid * 0.45f) +
-        wave2 * 0.25f +
-        beatGlow * 1.2f +
-        sparkle * 0.8f;
-
-      // True black in silence.
-      if (vol < 0.04f) {
-        intensity = 0.0f;
-      }
-
-      intensity = constrain(intensity, 0.0f, 1.0f);
-      intensity = powf(intensity, 1.35f);
-
-      // Small hue offsets make the tube feel alive,
-      // but keep note identity mostly visible.
-      uint8_t hue = baseHue + s * 2 + p * 0.03f + sideBias * 6.0f;
-
-      uint8_t sat = 235;
-      uint8_t val = (uint8_t)(intensity * 255.0f);
-
-      uint32_t c = hsvToRgb(hue, sat, val);
-
-      // Warm bass body
-      if (bass > 0.15f && p < activeLen * 0.55f && vol >= 0.04f) {
-        uint32_t warm = hsvToRgb(baseHue, 240, (uint8_t)(bass * 120));
-        c = addColor(c, scaleColor(warm, 0.35f));
-      }
-
-      // White beat impact
-      if (beatGlow > 0.01f && vol >= 0.04f) {
-        c = addColor(c, rgb(
-          (uint8_t)(beatGlow * 180),
-          (uint8_t)(beatGlow * 180),
-          (uint8_t)(beatGlow * 180)
-        ));
-      }
-
-      leds.setPixel(ledIndex(s, p), c);
+      // --- Mic 2 Processing Block: LEDs 191 down to 96 ---
+      int mic2OutputPixel = (LEDS_PER_STRIP - 1) - p; // Maps 0->191, 1->190 ... 95->96
+      processPixelPattern(s, p, mic2OutputPixel, mic2, sideBias, 0.9f); 
     }
   }
 
   leds.show();
 }
 
+// ---------- Debug Out Functions ----------
+void printDualPacketDebug() {
+  if (!VERBOSE) return;
+  static uint32_t lastPacketDebugMs = 0;
+  uint32_t now = millis();
+  if (now - lastPacketDebugMs < PACKET_DEBUG_INTERVAL_MS) return;
+  lastPacketDebugMs = now;
+
+  Serial.print("[M1] Pkts:"); Serial.print(mic1.frameCounter);
+  Serial.print(" BadChks:"); Serial.print(mic1.badChecksumCounter);
+  Serial.print(" Vol:"); Serial.print(mic1.audio.volume);
+  Serial.print(" | [M2] Pkts:"); Serial.print(mic2.frameCounter);
+  Serial.print(" BadChks:"); Serial.print(mic2.badChecksumCounter);
+  Serial.print(" Vol:"); Serial.println(mic2.audio.volume);
+}
+
+// ---------- Smoothing Filters Variables Matrix ----------
+void applySmoothingFilters(MicEngine &mic) {
+  mic.smVol = mic.smVol * 0.82f + mic.audio.volume * 0.18f;
+  mic.smBass = mic.smBass * 0.78f + mic.audio.bass * 0.22f;
+  mic.smMid = mic.smMid * 0.78f + mic.audio.mid * 0.22f;
+  mic.smTreble = mic.smTreble * 0.78f + mic.audio.treble * 0.22f;
+  mic.smNoteHue = mic.smNoteHue * 0.85f + mic.audio.noteHue * 0.15f;
+
+  if (mic.audio.volume == 0) {
+    mic.smVol *= 0.50f; mic.smBass *= 0.50f; mic.smMid *= 0.50f; mic.smTreble *= 0.50f;
+    if (mic.smVol < 3.0f) {
+      mic.smVol = 0.0f; mic.smBass = 0.0f; mic.smMid = 0.0f; mic.smTreble = 0.0f;
+    }
+  }
+}
+
+// ---------- System Architecture Entry Setup ----------
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial4.begin(UART_BAUD);
+  pinMode(MIC1_SERIAL_RTS, OUTPUT);
+  digitalWrite(MIC1_SERIAL_RTS, LOW);
+
+  MIC1_SERIAL.begin(UART_BAUD);
+  MIC2_SERIAL.begin(UART_BAUD);
 
   leds.begin();
   leds.show();
 
   if (VERBOSE) {
-    Serial.println();
-    Serial.println("Teensy LED renderer started");
-    Serial.println("UART:");
-    Serial.println("  Receiving XIAO audio data on Serial4 RX");
-    Serial.println("  Teensy 4.1 Serial4 RX = pin 16");
-    Serial.print("  UART baud: ");
-    Serial.println(UART_BAUD);
-
-    Serial.println("LED setup:");
-    Serial.print("  LED strips: ");
-    Serial.println(NUM_STRIPS);
-
-    Serial.print("  LEDs per strip: ");
-    Serial.println(LEDS_PER_STRIP);
-
-    Serial.print("  Total LEDs: ");
-    Serial.println(NUM_LEDS);
-
-    for (int s = 0; s < NUM_STRIPS; s++) {
-      Serial.print("  Strip ");
-      Serial.print(s);
-      Serial.print(" -> Teensy pin ");
-      Serial.println(pinList[s]);
-    }
-
-    Serial.println("Colour mapping from XIAO:");
-    Serial.println("  Do=red, Re=orange, Mi=yellow, Fa=green, Sol=cyan, La=blue, Si=violet");
+    Serial.println("\nTeensy Dual-Mic LED Renderer Started");
+    Serial.print("Mic 1 allocated to execution zone: LEDs 0 to 95\nMic 2 allocated to execution zone: LEDs 191 down to 96\n");
   }
 
   startupLedTest();
-
-  lastPacketDebugMs = millis();
 }
 
+// ---------- Main Execution Processing Loop ----------
 void loop() {
-  while (readAudioFrame()) {
-    // Drain pending frames
-  }
+  // Process and drain all pending incoming UART buffers
+  while (readAudioFrame(MIC1_SERIAL, mic1)) {}
+  while (readAudioFrame(MIC2_SERIAL, mic2)) {}
 
-  smVol = smVol * 0.82f + audio.volume * 0.18f;
-  smBass = smBass * 0.78f + audio.bass * 0.22f;
-  smMid = smMid * 0.78f + audio.mid * 0.22f;
-  smTreble = smTreble * 0.78f + audio.treble * 0.22f;
-  smNoteHue = smNoteHue * 0.85f + audio.noteHue * 0.15f;
+  // Apply math filters
+  applySmoothingFilters(mic1);
+  applySmoothingFilters(mic2);
 
-  // Extra hard silence clamp on Teensy side.
-  if (audio.volume == 0) {
-    smVol *= 0.50f;
-    smBass *= 0.50f;
-    smMid *= 0.50f;
-    smTreble *= 0.50f;
-
-    if (smVol < 3.0f) {
-      smVol = 0.0f;
-      smBass = 0.0f;
-      smMid = 0.0f;
-      smTreble = 0.0f;
-    }
-  }
-
+  // Render to strips hardware
   renderAudioTunnel();
 
-  printPacketDebug();
-  printVisualDebug();
-
+  printDualPacketDebug();
   delay(16);
 }
