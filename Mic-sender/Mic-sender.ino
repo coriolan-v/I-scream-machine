@@ -26,7 +26,7 @@
 #include <Arduino.h>
 #include <I2S.h>
 #include <arduinoFFT.h>
-#include <SerialPIO.h>  // Required for PIO-based Serial on D5
+//#include <SerialPIO.h>  // Required for PIO-based Serial on D5
 
 // ---------- Debug ----------
 #define VERBOSE true
@@ -36,13 +36,13 @@
 #define PIN_WS   3    // D10 / GPIO3
 #define PIN_SD   4    // D9 / GPIO4
 #define PIN_SCK  2    // D8 / GPIO2
-#define PIN_UART_TX   5  // Changed to physical Pin D5 (GPIO7)
+#define PIN_UART_TX   28  // Changed to physical Pin D5 (GPIO7)
 
 // ---------- UART ----------
 #define UART_BAUD 460800
 
 // Initialize PIO Serial on Pin D5 for TX, and disable RX (-1 / PIN_UNUSED)
-SerialPIO mySerial(PIN_UART_TX, 6);
+//SerialPIO Serial1(PIN_UART_TX, 6);
 
 // ---------- Audio ----------
 static constexpr uint32_t SAMPLE_RATE = 16000;
@@ -117,9 +117,9 @@ void sendFeatures(uint8_t vol, uint8_t bass, uint8_t mid, uint8_t treble, uint8_
 
   uint8_t c = checksumFrame(frame, 8);
 
-  // Swapped to use the newly initialized PIO mySerial channel
-  mySerial.write(frame, 8);
-  mySerial.write(c);
+  // Swapped to use the newly initialized PIO Serial1 channel
+  Serial1.write(frame, 8);
+  Serial1.write(c);
 }
 
 void updateBackground(float voiceEnergy, bool tooClicky, bool nearGateOpening) {
@@ -190,7 +190,7 @@ void setup() {
   startupMs = millis();
 
   // Initialize PIO Serial port to run on physical Pin D5
-  mySerial.begin(UART_BAUD);
+  Serial1.begin(UART_BAUD);
 
   i2s.setBCLK(PIN_SCK);
   i2s.setDATA(PIN_SD);

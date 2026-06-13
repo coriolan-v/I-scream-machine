@@ -14,9 +14,12 @@
 
 // ---------- Dual UART Configuration ----------
 #define MIC1_SERIAL Serial7   // Choose UART for Mic 1 (Drives LEDs 0 -> 95)
-#define MIC2_SERIAL Serial2   // Choose UART for Mic 2 (Drives LEDs 191 -> 96)
+#define MIC2_SERIAL Serial1   // Choose UART for Mic 2 (Drives LEDs 191 -> 96)
 
 #define MIC1_SERIAL_RTS 27
+#define MIC2_SERIAL_RTS 2
+
+#define LED_DEBUG 13
 
 // ---------- Debug ----------
 #define VERBOSE true
@@ -32,7 +35,10 @@ static constexpr int NUM_LEDS = NUM_STRIPS * LEDS_PER_STRIP;
 static constexpr uint32_t UART_BAUD = 460800;
 
 // Teensy LED pins
-byte pinList[NUM_STRIPS] = {33, 34, 35, 36, 37, 38, 39, 40, 17, 18, 19, 20};
+byte pinList[NUM_STRIPS] = {  33, 34, 35, 36,
+  37, 38, 39, 40,
+  18, 19, 20, 21
+};
 const int bytesPerLED = 3;
 
 DMAMEM int displayMemory[LEDS_PER_STRIP * NUM_STRIPS * bytesPerLED / 4];
@@ -370,11 +376,18 @@ void applySmoothingFilters(MicEngine &mic) {
 
 // ---------- System Architecture Entry Setup ----------
 void setup() {
+
+  pinMode(LED_DEBUG, OUTPUT);
+  digitalWrite(LED_DEBUG, HIGH);
+
   Serial.begin(115200);
   delay(500);
 
   pinMode(MIC1_SERIAL_RTS, OUTPUT);
   digitalWrite(MIC1_SERIAL_RTS, LOW);
+
+  pinMode(MIC2_SERIAL_RTS, OUTPUT);
+  digitalWrite(MIC2_SERIAL_RTS, LOW);
 
   MIC1_SERIAL.begin(UART_BAUD);
   MIC2_SERIAL.begin(UART_BAUD);
