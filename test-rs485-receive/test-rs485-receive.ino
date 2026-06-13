@@ -1,41 +1,48 @@
-#include <Arduino.h>
+// Teensy RS-485 Receiver Code
 
-uint32_t successfulBytesReceived = 0;
-unsigned long lastTelemPrint = 0;
-const unsigned long telemInterval = 500; // Update dashboard every 500ms
-uint8_t lastReceivedByte = 0;
+// Define the RS-485 Enable pin
+const int EN_PIN = 27;
+
+unsigned long lastPrintTime = 0;
+String receivedData = "";
 
 void setup() {
-  // Initialize native USB connection to your PC
+  // Initialize USB Serial for the computer monitor
   Serial.begin(115200);
   
-  // Open Serial4 on Pin 16
-  Serial4.begin(115200);
+  // Initialize Hardware Serial 7 at the same baud rate as the Xiao
+  Serial1.begin(115200);
   
-  delay(1500);
-  Serial.println("==========================================");
-  Serial.println("  TEENSY RECEIVER: LISTENING ON PIN 16    ");
-  Serial.println("==========================================");
+  // Configure the RS-485 Enable pin
+  pinMode(EN_PIN, OUTPUT);
+  
+  // Set to LOW to put the RS-485 transceiver into RECEIVE mode
+  digitalWrite(EN_PIN, LOW); 
+  
+  delay(1000);
+  Serial.println("Teensy Serial7 RS-485 Receiver Initialized...");
 }
 
 void loop() {
-  // Check if any loose bytes have landed in the hardware buffer
-  while (Serial4.available() > 0) {
-    // Pull the single raw byte out of the buffer
-    lastReceivedByte = Serial4.read();
-    successfulBytesReceived++;
+  // 1. Constantly check for incoming data on Serial7
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    receivedData += c; // Accumulate the incoming characters
   }
 
-  // Print the diagnostic dashboard to your PC screen
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastTelemPrint >= telemInterval) {
-    lastTelemPrint = currentMillis;
+  // 2. Print the accumulated data to the PC Monitor every 1 second
+  if (millis() - lastPrintTime >= 1000) {
+    lastPrintTime = millis();
     
-    Serial.println("--- RAW SERIAL WIRE REPORT ---");
-    Serial.print(" Total Bytes Intercepted: "); 
-    Serial.println(successfulBytesReceived);
-    Serial.print(" Last Byte Read Value  : "); 
-    Serial.println(lastReceivedByte);
-    Serial.println();
+    Serial.print("[" + String(millis()/1000) + "s] ");
+    if (receivedData.length() > 0) {
+      Serial.print("Received: ");
+      Serial.print(receivedData);
+      
+      // Clear the buffer string for the next second
+      receivedData = ""; 
+    } else {
+      Serial.println("No data received in the last second.");
+    }
   }
 }
