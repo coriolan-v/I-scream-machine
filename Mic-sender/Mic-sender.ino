@@ -30,12 +30,12 @@
 
 // ---------- Debug ----------
 #define VERBOSE true
-#define DEBUG_INTERVAL_MS 500
+#define DEBUG_INTERVAL_MS 50
 
 // ---------- Pins ----------
-#define PIN_SCK       27
-#define PIN_WS        28
-#define PIN_SD        29
+#define PIN_WS   3    // D10 / GPIO3
+#define PIN_SD   4    // D9 / GPIO4
+#define PIN_SCK  2    // D8 / GPIO2
 #define PIN_UART_TX   5  // Changed to physical Pin D5 (GPIO7)
 
 // ---------- UART ----------

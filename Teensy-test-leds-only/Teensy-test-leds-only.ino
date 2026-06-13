@@ -20,7 +20,7 @@
 const int numPins = 12;
 byte pinList[numPins] = {33, 34, 35, 36, 37, 38, 39, 40, 18, 19, 20, 21};
 
-const int ledsPerStrip = 120;
+const int ledsPerStrip = 384;
 
 
 // These buffers need to be large enough for all the pixels.
