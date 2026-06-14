@@ -189,9 +189,14 @@ void setup() {
 
   startupMs = millis();
 
-  // Initialize PIO Serial port to run on physical Pin D5
+  // Pull GPIO 28 HIGH just like in your successful test script
+  pinMode(28, OUTPUT);
+  digitalWrite(28, HIGH);
+
+  // Initialize the standard hardware Serial1 
   Serial1.begin(UART_BAUD);
 
+  // Re-assign I2S to the non-conflicting pins
   i2s.setBCLK(PIN_SCK);
   i2s.setDATA(PIN_SD);
   i2s.setBitsPerSample(32);
@@ -204,7 +209,7 @@ void setup() {
 
   if (VERBOSE) {
     Serial.println("\nXIAO RP2040 adaptive festival scream analyzer initialized");
-    Serial.print("PIO Transmit Running on Pin D5 at: "); Serial.println(UART_BAUD);
+    Serial.print("Hardware Serial1 Running on Pin D9 (GPIO4) at: "); Serial.println(UART_BAUD);
   }
 }
 

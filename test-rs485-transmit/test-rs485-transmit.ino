@@ -8,7 +8,7 @@ void setup() {
   pinMode(28, OUTPUT);
   digitalWrite(28, HIGH);
   
-  Serial1.begin(460800);
+  Serial1.begin(115200);
 
 
 }
