@@ -130,9 +130,9 @@ void fillAll(uint32_t color) {
 }
 
 void startupLedTest() {
-  fillAll(rgb(255, 0, 0)); delay(500);
-  fillAll(rgb(0, 255, 0)); delay(500);
-  fillAll(rgb(0, 0, 255)); delay(500);
+  fillAll(rgb(120, 0, 0)); delay(500);
+  fillAll(rgb(0, 120, 0)); delay(500);
+  fillAll(rgb(0, 0, 120)); delay(500);
   fillAll(rgb(0, 0, 0));   delay(100);
 }
 
@@ -264,21 +264,7 @@ void renderAudioTunnel() {
 
   uint32_t currentMs = millis();
 
-  // --- 1. Latched Cluster Clock Scheduler Engine ---
-  // if (!modeChangePending && (currentMs - lastModeSwitchMs >= modeDurationMs)) {
-  //   modeChangePending = true;
-  //   pendingMode = (currentMode == TUNNEL_MODE) ? CLUSTER_MODE : TUNNEL_MODE;
-  // }
-
-  // if (modeChangePending && (volAvg < 0.05f)) {
-  //   currentMode = pendingMode;
-  //   modeChangePending = false;
-  //   lastModeSwitchMs = currentMs;
-  //   modeDurationMs = (uint32_t)random(15000, 30001); 
-  //   if (currentMode == CLUSTER_MODE) clockTrackAngle = targetClockTrack;
-  // }
-
-  // --- 2. Spatial Direction Tracker ---
+  // --- 1. Spatial Direction Tracker ---
   bool beatDetected = (mic1.audio.beat > 0 || mic2.audio.beat > 0);
   bool quietTimeout = (currentMs - lastRandomHopMs > 1200);
 
@@ -309,15 +295,32 @@ void renderAudioTunnel() {
     mic2.smVol *= 0.85f; mic2.smBass *= 0.85f; mic2.smMid *= 0.85f; mic2.smTreble *= 0.85f;
   }
 
-  // --- 3. Dominance Ratios Engine ---
-  float totalVol = v1 + v2;
-  float mic1Dominance = 1.0f;
-  float mic2Dominance = 1.0f;
+  // --- 2. HARD ACOUSTIC DOMINANCE & DIRECTION ENGINE ---
+  float mic1Dominance = 0.0f;
+  float mic2Dominance = 0.0f;
+  
+  float volumeDelta = fabsf(v1 - v2);
+  float crossoverThreshold = 0.15f; // Adjust this (0.05 to 0.25) to tune how easily one side completely wins
 
-  if (totalVol > 0.01f) {
-    // Determine winner ratio. Squaring the ratio increases contrast between loudest sound source.
-    mic1Dominance = powf(v1 / totalVol, 2.0f) * 1.5f;
-    mic2Dominance = powf(v2 / totalVol, 2.0f) * 1.5f;
+  if (v1 > 0.02f || v2 > 0.02f) {
+    if (v1 > v2) {
+      mic1Dominance = 1.0f;
+      // If Mic 1 is significantly louder, completely kill Mic 2's pattern
+      if (volumeDelta > crossoverThreshold) {
+        mic2Dominance = 0.0f;
+      } else {
+        // Soft gradient mix if they are neck-and-neck
+        mic2Dominance = 1.0f - (volumeDelta / crossoverThreshold);
+      }
+    } else {
+      mic2Dominance = 1.0f;
+      // If Mic 2 is significantly louder, completely kill Mic 1's pattern
+      if (volumeDelta > crossoverThreshold) {
+        mic1Dominance = 0.0f;
+      } else {
+        mic1Dominance = 1.0f - (volumeDelta / crossoverThreshold);
+      }
+    }
   }
 
   // ---------- LED Renderer Pass ----------
@@ -330,7 +333,6 @@ void renderAudioTunnel() {
       if (angularDiff > 6.0f) angularDiff = 12.0f - angularDiff;
       float allowedWidth = 1.2f + (((mic1.smTreble + mic2.smTreble) / 510.0f) * 0.8f);
       if (angularDiff > allowedWidth) {
-        // Clear old display memory buffers on dead strips
         for (int p = 0; p < LEDS_PER_STRIP; p++) leds.setPixel(ledIndex(s, p), 0);
         continue;
       }
@@ -341,37 +343,38 @@ void renderAudioTunnel() {
       uint32_t color1 = 0;
       uint32_t color2 = 0;
 
-      // Mic 1 Wave starts at 0 and goes right
+      // Mic 1 Wave: Source starts at index 0, ripples forward to the right
       float intensity1 = getWaveIntensity(s, p, mic1, 1.0f, color1);
-      // Mic 2 Wave starts at end (SIDE_LEDS - 1) and goes left
+      
+      // Mic 2 Wave: Source starts at index (SIDE_LEDS - 1), ripples forward to the left
       int m2Distance = (SIDE_LEDS - 1) - p; 
       float intensity2 = getWaveIntensity(s, m2Distance, mic2, 0.95f, color2);
 
-      // Apply dynamic acoustic dominance filters
+      // Apply dynamic direction/dominance masking
       color1 = scaleColor(color1, mic1Dominance * windowFilter);
       color2 = scaleColor(color2, mic2Dominance * windowFilter);
 
       uint32_t finalOutsideColor = addColor(color1, color2);
 
       // --- Localized Wave Collision Engine ---
-      // A collision occurs if both opposing wave fronts occupy the same physical coordinate and exceed threshold
-      if (intensity1 > 0.15f && intensity2 > 0.15f) {
-        // Compute force of collision flash
+      // A collision CAN ONLY happen if both dominances are active (> 0.0), meaning 
+      // people are making sound into BOTH ends at the exact same time.
+      if (mic1Dominance > 0.0f && mic2Dominance > 0.0f && intensity1 > 0.15f && intensity2 > 0.15f) {
         float collisionForce = (intensity1 + intensity2) * 0.5f;
         
-        // Add localized white sparkle layer based on high energy interaction
+        // Generates white hot friction sparkles right where the traveling waves intersect
         uint32_t hash = (uint32_t)(p * 16777619UL + s * 31UL + (uint32_t)(flow * 2.0f));
-        if (((hash >> 20) & 0xFF) > 180) { // Sparkle density inside collision threshold zones
+        if (((hash >> 20) & 0xFF) > 160) { 
           uint8_t flashVal = (uint8_t)(collisionForce * 255.0f);
           uint32_t whiteFlash = rgb(flashVal, flashVal, flashVal);
           finalOutsideColor = addColor(finalOutsideColor, whiteFlash);
         }
       }
 
-      // Write direct to physical hardware layout maps
+      // Write directly to outside channel layout maps
       leds.setPixel(ledIndex(s, p), scaleColor(finalOutsideColor, OUTSIDE_BRIGHTNESS));
 
-      // Inverse mirror assignment direct to inside structural layout
+      // Inverse mirror assignment directly to inside structural layout
       int insidePixel = SIDE_LEDS + (SIDE_LEDS - 1 - p);
       leds.setPixel(ledIndex(s, insidePixel), scaleColor(finalOutsideColor, INSIDE_BRIGHTNESS));
     }
