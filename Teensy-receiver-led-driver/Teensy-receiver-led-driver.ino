@@ -1,16 +1,16 @@
 /*
-  Teensy 4.1 LED renderer (Dual Mic Audio Tunnel)
+  Teensy 4.1 LED renderer (Dual Mic Audio Tunnel - Mirrored Double-Sided Tube)
 
   Receives compact audio frames from TWO XIAO RP2040s over designated UARTs.
-
-  Suggested Hardware UART Wiring Options for Teensy 4.1:
-    Mic 1 TX -> Teensy Pin 16 (Serial4 RX) -> Default
-    Mic 2 TX -> Teensy Pin 0  (Serial1 RX) -> Default
-    GNDs     -> Common Teensy GND
+  Maps them to 12 double-sided strips arranged like clock numbers.
 */
 
 #include <Arduino.h>
 #include <OctoWS2811.h>
+
+// ---------- Dual Brightness Configuration ----------
+static constexpr float OUTSIDE_BRIGHTNESS = 1.0f; // Brightness scaling for LEDs 0 -> 191 (0.0 to 1.0)
+static constexpr float INSIDE_BRIGHTNESS  = 0.5f; // Brightness scaling for LEDs 192 -> 383 (0.0 to 1.0)
 
 // ---------- Dual UART Configuration ----------
 #define MIC1_SERIAL Serial7   // Choose UART for Mic 1 (Drives LEDs 0 -> 95)
@@ -26,16 +26,18 @@
 #define DEBUG_INTERVAL_MS 1000
 #define PACKET_DEBUG_INTERVAL_MS 500
 
-// ---------- LEDs ----------
+// ---------- LEDs Physical Geometry ----------
 static constexpr int NUM_STRIPS = 12;
-static constexpr int LEDS_PER_STRIP = 192;
-static constexpr int HALF_LEDS = LEDS_PER_STRIP / 2; // 96 LEDs per segment
+static constexpr int LEDS_PER_STRIP = 384;            // Total LEDs per strip (Out + In)
+static constexpr int SIDE_LEDS = LEDS_PER_STRIP / 2;  // 192 LEDs on Outside, 192 on Inside
+static constexpr int HALF_LEDS = SIDE_LEDS / 2;      // 96 LEDs per Mic segment
 static constexpr int NUM_LEDS = NUM_STRIPS * LEDS_PER_STRIP;
 
 static constexpr uint32_t UART_BAUD = 460800;
 
 // Teensy LED pins
-byte pinList[NUM_STRIPS] = {  33, 34, 35, 36,
+byte pinList[NUM_STRIPS] = {  
+  33, 34, 35, 36,
   37, 38, 39, 40,
   18, 19, 20, 21
 };
@@ -225,9 +227,8 @@ uint32_t addColor(uint32_t a, uint32_t b) {
 }
 
 // ---------- Render Engine Segment ----------
-// targetPixel is the clean sequential layout (0 to 95)
-// outputPixel maps it dynamically to physical layouts
-void processPixelPattern(int strip, int targetPixel, int outputPixel, MicEngine &mic, float sideBias, float speedModifier) {
+// Process a single pattern value and push it to both outside and inverted inside channels
+void processPixelPattern(int strip, int targetPixel, int outsidePixel, MicEngine &mic, float sideBias, float speedModifier) {
   float vol = mic.smVol / 255.0f;
   float bass = mic.smBass / 255.0f;
   float mid = mic.smMid / 255.0f;
@@ -251,6 +252,7 @@ void processPixelPattern(int strip, int targetPixel, int outputPixel, MicEngine 
   float wave = max(0.0f, 1.0f - d / waveWidth);
   wave = wave * wave;
 
+  // Secondary wave
   float wavePos2 = HALF_LEDS - wavePos;
   float d2 = fabsf(x - wavePos2);
   float wave2 = max(0.0f, 1.0f - d2 / (waveWidth * 1.4f));
@@ -262,7 +264,7 @@ void processPixelPattern(int strip, int targetPixel, int outputPixel, MicEngine 
   float beatGlow = max(0.0f, 1.0f - beatD / 10.0f) * mic.beatPulse;
 
   // Sparkle generator
-  uint32_t hash = (uint32_t)(outputPixel * 1103515245UL + strip * 12345UL + (uint32_t)(flow * 17));
+  uint32_t hash = (uint32_t)(outsidePixel * 1103515245UL + strip * 12345UL + (uint32_t)(flow * 17));
   float sparkle = ((hash >> 24) & 0xFF) / 255.0f;
   if (sparkle > (0.985f - sparkleAmount * 0.06f)) {
     sparkle = sparkleAmount;
@@ -296,26 +298,30 @@ void processPixelPattern(int strip, int targetPixel, int outputPixel, MicEngine 
     c = addColor(c, rgb((uint8_t)(beatGlow * 180), (uint8_t)(beatGlow * 180), (uint8_t)(beatGlow * 180)));
   }
 
-  leds.setPixel(ledIndex(strip, outputPixel), c);
+  // --- Send to Outside Path ---
+  leds.setPixel(ledIndex(strip, outsidePixel), scaleColor(c, OUTSIDE_BRIGHTNESS));
+
+  // --- Send to Inside Path (Mirrored & Spatial Inversion) ---
+  // Because the wire physically runs back "underneath", index 192 matches up with index 191.
+  int insidePixel = SIDE_LEDS + (SIDE_LEDS - 1 - outsidePixel);
+  leds.setPixel(ledIndex(strip, insidePixel), scaleColor(c, INSIDE_BRIGHTNESS));
 }
 
 // ---------- Render Audio Tunnel Loops ----------
 void renderAudioTunnel() {
-  // Drive mutual flow variables using both engine variations
   float midAvg = (mic1.smMid + mic2.smMid) / 510.0f;
   float bassAvg = (mic1.smBass + mic2.smBass) / 510.0f;
   flow += 0.35f + midAvg * 2.3f + bassAvg * 0.8f;
 
   if (flow > 100000.0f) flow = 0;
 
-  // Manage individual beat triggers
   mic1.beatPulse *= 0.88f;
   if (mic1.audio.beat > 0) mic1.beatPulse = 1.0f;
 
   mic2.beatPulse *= 0.88f;
   if (mic2.audio.beat > 0) mic2.beatPulse = 1.0f;
 
-  // Watchdog watchdog data loss safety timeouts
+  // Watchdog data loss safety timeouts
   uint32_t currentMs = millis();
   if (currentMs - mic1.lastFrameMs > 500) {
     mic1.smVol *= 0.85f; mic1.smBass *= 0.85f; mic1.smMid *= 0.85f; mic1.smTreble *= 0.85f;
@@ -328,14 +334,14 @@ void renderAudioTunnel() {
     float stripPhase = (float)s / NUM_STRIPS;
     float sideBias = sinf(stripPhase * TWO_PI + flow * 0.015f) * 0.5f + 0.5f;
 
-    // Loop through individual channel zones
+    // Loop through individual mic channel zones
     for (int p = 0; p < HALF_LEDS; p++) {
-      // --- Mic 1 Processing Block: LEDs 0 to 95 ---
+      // --- Mic 1 Processing Block: Outside LEDs 0 to 95 ---
       processPixelPattern(s, p, p, mic1, sideBias, 1.0f);
 
-      // --- Mic 2 Processing Block: LEDs 191 down to 96 ---
-      int mic2OutputPixel = (LEDS_PER_STRIP - 1) - p; // Maps 0->191, 1->190 ... 95->96
-      processPixelPattern(s, p, mic2OutputPixel, mic2, sideBias, 0.9f); 
+      // --- Mic 2 Processing Block: Outside LEDs 191 down to 96 ---
+      int mic2OutsidePixel = (SIDE_LEDS - 1) - p; 
+      processPixelPattern(s, p, mic2OutsidePixel, mic2, sideBias, 0.9f); 
     }
   }
 
@@ -376,7 +382,6 @@ void applySmoothingFilters(MicEngine &mic) {
 
 // ---------- System Architecture Entry Setup ----------
 void setup() {
-
   pinMode(LED_DEBUG, OUTPUT);
   digitalWrite(LED_DEBUG, HIGH);
 
@@ -396,8 +401,7 @@ void setup() {
   leds.show();
 
   if (VERBOSE) {
-    Serial.println("\nTeensy Dual-Mic LED Renderer Started");
-    Serial.print("Mic 1 allocated to execution zone: LEDs 0 to 95\nMic 2 allocated to execution zone: LEDs 191 down to 96\n");
+    Serial.println("\nTeensy Dual-Mic Double-Sided Tube Renderer Started");
   }
 
   startupLedTest();
@@ -405,15 +409,12 @@ void setup() {
 
 // ---------- Main Execution Processing Loop ----------
 void loop() {
-  // Process and drain all pending incoming UART buffers
   while (readAudioFrame(MIC1_SERIAL, mic1)) {}
   while (readAudioFrame(MIC2_SERIAL, mic2)) {}
 
-  // Apply math filters
   applySmoothingFilters(mic1);
   applySmoothingFilters(mic2);
 
-  // Render to strips hardware
   renderAudioTunnel();
 
   printDualPacketDebug();
