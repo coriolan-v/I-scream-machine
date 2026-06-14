@@ -1,3 +1,4 @@
+
 /*
   Teensy 4.1 LED renderer (Dual Mic Audio Tunnel - Mirrored Double-Sided Tube)
 
@@ -9,7 +10,7 @@
 #include <OctoWS2811.h>
 
 // ---------- Performance & Timing Configuration ----------
-static constexpr uint32_t TARGET_FPS = 90;        // Target frames per second (e.g., 60, 90, 120)
+static constexpr uint32_t TARGET_FPS = 60;        // Target frames per second (e.g., 60, 90, 120)
 static constexpr uint32_t FRAME_PERIOD_MS = 1000 / TARGET_FPS;
 
 // ---------- Dual Brightness Configuration ----------
@@ -17,8 +18,8 @@ static constexpr float OUTSIDE_BRIGHTNESS = 1.0f; // Brightness scaling for LEDs
 static constexpr float INSIDE_BRIGHTNESS  = 0.5f; // Brightness scaling for LEDs 192 -> 383 (0.0 to 1.0)
 
 // ---------- Dual UART Configuration ----------
-#define MIC1_SERIAL Serial7   // Choose UART for Mic 1 (Drives LEDs 0 -> 95)
-#define MIC2_SERIAL Serial1   // Choose UART for Mic 2 (Drives LEDs 191 -> 96)
+#define MIC1_SERIAL Serial7   // Choose UART for Mic 1
+#define MIC2_SERIAL Serial1   // Choose UART for Mic 2
 
 #define MIC1_SERIAL_RTS 27
 #define MIC2_SERIAL_RTS 2
@@ -33,8 +34,7 @@ static constexpr float INSIDE_BRIGHTNESS  = 0.5f; // Brightness scaling for LEDs
 // ---------- LEDs Physical Geometry ----------
 static constexpr int NUM_STRIPS = 12;
 static constexpr int LEDS_PER_STRIP = 384;            // Total LEDs per strip (Out + In)
-static constexpr int SIDE_LEDS = LEDS_PER_STRIP / 2;  // 192 LEDs on Outside, 192 on Inside
-static constexpr int HALF_LEDS = SIDE_LEDS / 2;      // 96 LEDs per Mic segment
+static constexpr int SIDE_LEDS = LEDS_PER_STRIP / 2;  // 192 LEDs on Outside (2 meters), 192 on Inside
 static constexpr int NUM_LEDS = NUM_STRIPS * LEDS_PER_STRIP;
 
 static constexpr uint32_t UART_BAUD = 460800;
@@ -231,8 +231,9 @@ uint32_t addColor(uint32_t a, uint32_t b) {
   return rgb(min(255, ar + br), min(255, ag + bg), min(255, ab + bb));
 }
 
-// ---------- Render Engine Segment ----------
-void processPixelPattern(int strip, int targetPixel, int outsidePixel, MicEngine &mic, float sideBias, float speedModifier) {
+// ---------- Render Math Engine ----------
+// Evaluates the math for a single engine pass relative to its launching end
+uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float sideBias, float speedModifier) {
   float vol = mic.smVol / 255.0f;
   float bass = mic.smBass / 255.0f;
   float mid = mic.smMid / 255.0f;
@@ -241,28 +242,28 @@ void processPixelPattern(int strip, int targetPixel, int outsidePixel, MicEngine
 
   float x = (float)targetPixel;
 
-  float activeLen = 4.0f + powf(vol, 0.65f) * (HALF_LEDS - 4);
-  float waveWidth = 4.0f + bass * 15.0f;
+  float activeLen = 4.0f + powf(vol, 0.65f) * (SIDE_LEDS - 4);
+  float waveWidth = 4.0f + bass * 25.0f;
   float sparkleAmount = treble;
 
   float edge = activeLen - x;
-  float bar = constrain(edge / 9.0f, 0.0f, 1.0f);
+  float bar = constrain(edge / 12.0f, 0.0f, 1.0f);
 
-  float wavePos = fmodf(flow * speedModifier + strip * 13.0f, HALF_LEDS + waveWidth * 2.0f) - waveWidth;
+  float wavePos = fmodf(flow * speedModifier + strip * 13.0f, SIDE_LEDS + waveWidth * 2.0f) - waveWidth;
   float d = fabsf(x - wavePos);
   float wave = max(0.0f, 1.0f - d / waveWidth);
   wave = wave * wave;
 
-  float wavePos2 = HALF_LEDS - wavePos;
+  float wavePos2 = SIDE_LEDS - wavePos;
   float d2 = fabsf(x - wavePos2);
   float wave2 = max(0.0f, 1.0f - d2 / (waveWidth * 1.4f));
   wave2 = wave2 * wave2 * 0.6f;
 
-  float beatPos = (1.0f - mic.beatPulse) * HALF_LEDS;
+  float beatPos = (1.0f - mic.beatPulse) * SIDE_LEDS;
   float beatD = fabsf(x - beatPos);
-  float beatGlow = max(0.0f, 1.0f - beatD / 10.0f) * mic.beatPulse;
+  float beatGlow = max(0.0f, 1.0f - beatD / 15.0f) * mic.beatPulse;
 
-  uint32_t hash = (uint32_t)(outsidePixel * 1103515245UL + strip * 12345UL + (uint32_t)(flow * 17));
+  uint32_t hash = (uint32_t)(targetPixel * 1103515245UL + strip * 12345UL + (uint32_t)(flow * 17));
   float sparkle = ((hash >> 24) & 0xFF) / 255.0f;
   if (sparkle > (0.985f - sparkleAmount * 0.06f)) {
     sparkle = sparkleAmount;
@@ -294,12 +295,7 @@ void processPixelPattern(int strip, int targetPixel, int outsidePixel, MicEngine
     c = addColor(c, rgb((uint8_t)(beatGlow * 180), (uint8_t)(beatGlow * 180), (uint8_t)(beatGlow * 180)));
   }
 
-  // Outside Path Mapping
-  leds.setPixel(ledIndex(strip, outsidePixel), scaleColor(c, OUTSIDE_BRIGHTNESS));
-
-  // Inside Path Mapping (Mirroring + Inversion)
-  int insidePixel = SIDE_LEDS + (SIDE_LEDS - 1 - outsidePixel);
-  leds.setPixel(ledIndex(strip, insidePixel), scaleColor(c, INSIDE_BRIGHTNESS));
+  return c;
 }
 
 // ---------- Render Audio Tunnel Loops ----------
@@ -307,13 +303,11 @@ void renderAudioTunnel() {
   float midAvg = (mic1.smMid + mic2.smMid) / 510.0f;
   float bassAvg = (mic1.smBass + mic2.smBass) / 510.0f;
   
-  // Normalize step speed regardless of targeted framerate target options
   float speedNormalization = 60.0f / (float)TARGET_FPS;
   flow += (0.35f + midAvg * 2.3f + bassAvg * 0.8f) * speedNormalization;
 
   if (flow > 100000.0f) flow = 0;
 
-  // Frame decay adjustments tied loosely to target frame frequencies
   float decayFactor = powf(0.88f, speedNormalization);
   mic1.beatPulse *= decayFactor;
   if (mic1.audio.beat > 0) mic1.beatPulse = 1.0f;
@@ -333,13 +327,25 @@ void renderAudioTunnel() {
     float stripPhase = (float)s / NUM_STRIPS;
     float sideBias = sinf(stripPhase * TWO_PI + flow * 0.015f) * 0.5f + 0.5f;
 
-    for (int p = 0; p < HALF_LEDS; p++) {
-      // Mic 1: Outside 0 -> 95
-      processPixelPattern(s, p, p, mic1, sideBias, 1.0f);
+    // Run spatial calculations sequentially down the full 2m length
+    for (int p = 0; p < SIDE_LEDS; p++) {
+      
+      // Mic 1: Starts at physical Pixel 0, travels to 191
+      uint32_t colorM1 = computePatternColor(s, p, mic1, sideBias, 1.0f);
 
-      // Mic 2: Outside 191 down to 96
-      int mic2OutsidePixel = (SIDE_LEDS - 1) - p; 
-      processPixelPattern(s, p, mic2OutsidePixel, mic2, sideBias, 0.9f); 
+      // Mic 2: Starts at physical Pixel 191, travels down to 0
+      int mic2InvertedPixel = (SIDE_LEDS - 1) - p;
+      uint32_t colorM2 = computePatternColor(s, mic2InvertedPixel, mic2, sideBias, 0.9f);
+
+      // Clean additive blend so they cross paths perfectly
+      uint32_t blendedColor = addColor(colorM1, colorM2);
+
+      // Assign to physical outside strip layout
+      leds.setPixel(ledIndex(s, p), scaleColor(blendedColor, OUTSIDE_BRIGHTNESS));
+
+      // Mirror onto inside loop with full spatial inversion
+      int insidePixel = SIDE_LEDS + (SIDE_LEDS - 1 - p);
+      leds.setPixel(ledIndex(s, insidePixel), scaleColor(blendedColor, INSIDE_BRIGHTNESS));
     }
   }
 
@@ -404,7 +410,7 @@ void setup() {
   leds.show();
 
   if (VERBOSE) {
-    Serial.print("\nTeensy Dual-Mic Renderer Started running non-blocking @ ");
+    Serial.print("\nTeensy Dual-End Full-Travel Additive Blended Renderer Started @ ");
     Serial.print(TARGET_FPS);
     Serial.println(" FPS");
   }
@@ -415,11 +421,9 @@ void setup() {
 
 // ---------- Main Execution Processing Loop ----------
 void loop() {
-  // Always drain incoming serial packets immediately to prevent buffer overflows
   while (readAudioFrame(MIC1_SERIAL, mic1)) {}
   while (readAudioFrame(MIC2_SERIAL, mic2)) {}
 
-  // Run visual transformations and strip calculations at the targeted FPS rate
   uint32_t currentMs = millis();
   if (currentMs - lastFrameRenderMs >= FRAME_PERIOD_MS) {
     lastFrameRenderMs = currentMs;
