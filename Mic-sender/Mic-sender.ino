@@ -1,3 +1,4 @@
+
 /*
   XIAO RP2040 + INMP441 I2S microphone
 
@@ -6,8 +7,8 @@
     - Tracks changing ambient noise when gate is closed
     - Freezes background learning when someone screams/talks loudly
     - Sends volume=0 for background
-    - Sends strong volume for close voice/scream inside tube
-    - Estimates dominant voice frequency
+    - DYNAMIC RANGE HEADROOM UPDATE: Auto-adjusts scaling ceilings on peaks
+      to prevent immediate clipping at 255.
     - Maps pitch to rainbow solfège colour
 
   I2S pins:
@@ -26,7 +27,6 @@
 #include <Arduino.h>
 #include <I2S.h>
 #include <arduinoFFT.h>
-//#include <SerialPIO.h>  // Required for PIO-based Serial on D5
 
 // ---------- Debug ----------
 #define VERBOSE true
@@ -41,12 +41,9 @@
 // ---------- UART ----------
 #define UART_BAUD 460800
 
-// Initialize PIO Serial on Pin D5 for TX, and disable RX (-1 / PIN_UNUSED)
-//SerialPIO Serial1(PIN_UART_TX, 6);
-
 // ---------- Audio ----------
-static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr uint16_t FFT_SIZE = 256;
+static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr float MIC_GAIN = 3.0f;
 
 // ---------- Adaptive background / gate tuning ----------
@@ -63,8 +60,10 @@ static constexpr float MAX_TREBLE_TO_VOICE_RATIO = 1.8f;
 static constexpr float BG_DOWN_RATE = 0.030f;
 static constexpr float BG_UP_RATE = 0.004f;
 static constexpr float BG_FAST_UP_RATE = 0.012f;
-static constexpr float VOLUME_RANGE_MULT = 5.0f;
-static constexpr float VOLUME_CURVE = 0.70f;
+
+// --- CRITICAL DYNAMIC RANGE ADDITIONS ---
+static float dynamicHeadroomCeiling = 0.5f; // Starts conservative, stretches automatically
+static constexpr float HEADROOM_DECAY = 0.993f; // Slowly pulls down sensitivity ceiling during silence
 
 // ---------- Pitch / colour tuning ----------
 static constexpr float PITCH_MIN_HZ = 120.0f;
@@ -116,8 +115,6 @@ void sendFeatures(uint8_t vol, uint8_t bass, uint8_t mid, uint8_t treble, uint8_
   frame[7] = beat;
 
   uint8_t c = checksumFrame(frame, 8);
-
-  // Swapped to use the newly initialized PIO Serial1 channel
   Serial1.write(frame, 8);
   Serial1.write(c);
 }
@@ -171,15 +168,13 @@ void printDebug(float rms, float voiceEnergy, float trebleRatio, bool tooClicky,
   if (now - lastDebugMs < DEBUG_INTERVAL_MS) return;
   lastDebugMs = now;
 
-  Serial.print("[XIAO] frames=");       Serial.print(frameCounter);
-  Serial.print(" calib=");             Serial.print(startupCalibrating ? "YES" : "no");
-  Serial.print(" rms=");               Serial.print(rms, 5);
-  Serial.print(" voice=");             Serial.print(voiceEnergy, 5);
-  Serial.print(" bg=");                Serial.print(backgroundEnergy, 5);
-  Serial.print(" gate=");              Serial.print(gateOpen ? "OPEN" : "closed");
-  Serial.print(" peakHz=");            Serial.print(peakVoiceFreq, 0);
-  Serial.print(" note=");              Serial.print(lastNoteName);
+  Serial.print("[XIAO] gate=");         Serial.print(gateOpen ? "OPEN" : "closed");
+  Serial.print(" voice=");             Serial.print(voiceEnergy, 4);
+  Serial.print(" ceil=");              Serial.print(dynamicHeadroomCeiling, 4);
   Serial.print(" vol=");               Serial.print(vol);
+  Serial.print(" bass=");              Serial.print(bass);
+  Serial.print(" mid=");               Serial.print(mid);
+  Serial.print(" treble=");            Serial.print(treble);
   Serial.print(" beat=");              Serial.println(beat);
 }
 
@@ -189,14 +184,11 @@ void setup() {
 
   startupMs = millis();
 
-  // Pull GPIO 28 HIGH just like in your successful test script
   pinMode(28, OUTPUT);
   digitalWrite(28, HIGH);
 
-  // Initialize the standard hardware Serial1 
   Serial1.begin(UART_BAUD);
 
-  // Re-assign I2S to the non-conflicting pins
   i2s.setBCLK(PIN_SCK);
   i2s.setDATA(PIN_SD);
   i2s.setBitsPerSample(32);
@@ -208,8 +200,7 @@ void setup() {
   }
 
   if (VERBOSE) {
-    Serial.println("\nXIAO RP2040 adaptive festival scream analyzer initialized");
-    Serial.print("Hardware Serial1 Running on Pin D9 (GPIO4) at: "); Serial.println(UART_BAUD);
+    Serial.println("\nXIAO Dynamic Range Auto-Compressor Online.");
   }
 }
 
@@ -312,13 +303,28 @@ void loop() {
   float normVol = 0.0f;
 
   if (gateOpen) {
-    float over = (smoothVoiceEnergy - closeThreshold) / max(backgroundEnergy * VOLUME_RANGE_MULT, 0.001f);
-    normVol = constrain(over, 0.0f, 1.0f);
-    normVol = powf(normVol, VOLUME_CURVE);
+    // --- STEP 1: CALCULATE RAW NET ENERGY ABOVE THE GATE ---
+    float signalDelta = smoothVoiceEnergy - closeThreshold;
+    if (signalDelta < 0.0f) signalDelta = 0.0f;
+
+    // --- STEP 2: ADAPTIVE CEILING TRACKER ---
+    // If the signal exceeds our current target window, push the ceiling up immediately.
+    if (signalDelta > dynamicHeadroomCeiling) {
+      dynamicHeadroomCeiling = signalDelta;
+    } else {
+      // Slow release decay down to a minimum anchor point of 0.2f
+      dynamicHeadroomCeiling = (dynamicHeadroomCeiling * HEADROOM_DECAY) + (0.2f * (1.0f - HEADROOM_DECAY));
+    }
+
+    // --- STEP 3: LOGARITHMIC COMPRESSION CURVE ---
+    // Maps raw signal to a predictable 0.0 -> 1.0 slope using logarithmic softening.
+    float inputRatio = signalDelta / dynamicHeadroomCeiling;
+    normVol = log1pf(inputRatio * 1.718f) / log1pf(1.718f); // Soft-knee logarithmic map
+    normVol = constrain(normVol, 0.0f, 1.0f);
   }
 
-  if (normVol > smoothVol) smoothVol = smoothVol * 0.35f + normVol * 0.65f;
-  else                     smoothVol = smoothVol * 0.84f + normVol * 0.16f;
+  if (normVol > smoothVol) smoothVol = smoothVol * 0.30f + normVol * 0.70f;
+  else                     smoothVol = smoothVol * 0.80f + normVol * 0.20f;
 
   if (!gateOpen || startupCalibrating) {
     smoothVol *= 0.35f;
@@ -329,12 +335,12 @@ void loop() {
   uint8_t noteHue = lastNoteHue;
 
   if (gateOpen) {
-    float adaptiveBandScale = 0.20f / max(backgroundEnergy, 0.020f);
-    adaptiveBandScale = constrain(adaptiveBandScale, 0.015f, 0.12f);
-
-    bass = clampByte(constrain(lowVoiceE * adaptiveBandScale, 0.0f, 1.0f) * 255);
-    mid = clampByte(constrain(midVoiceE * adaptiveBandScale * 0.75f, 0.0f, 1.0f) * 255);
-    treble = clampByte(constrain(highVoiceE * adaptiveBandScale * 0.85f, 0.0f, 1.0f) * 255);
+    // Dynamically balance sub-band scalars using our rolling dynamic range context
+    float adaptiveBandScale = 1.0f / max(dynamicHeadroomCeiling, 0.1f);
+    
+    bass = clampByte(constrain((lowVoiceE * 0.55f) * adaptiveBandScale, 0.0f, 1.0f) * 255);
+    mid = clampByte(constrain((midVoiceE * 1.00f) * adaptiveBandScale, 0.0f, 1.0f) * 255);
+    treble = clampByte(constrain((highVoiceE * 0.90f) * adaptiveBandScale, 0.0f, 1.0f) * 255);
 
     const char *noteName = "Do";
     uint8_t targetHue = noteHueFromFrequency(peakVoiceFreq, &noteName);
@@ -347,7 +353,7 @@ void loop() {
     noteHue = lastNoteHue;
   }
 
-  bool isBeat = gateOpen && smoothVol > 0.22f && smoothVol > prevVol * 1.30f;
+  bool isBeat = gateOpen && smoothVol > 0.22f && smoothVol > prevVol * 1.25f;
   prevVol = prevVol * 0.88f + smoothVol * 0.12f;
 
   uint8_t vol = clampByte(smoothVol * 255.0f);
