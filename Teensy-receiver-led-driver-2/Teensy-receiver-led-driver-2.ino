@@ -1,4 +1,11 @@
+/*
+  Teensy 4.1 LED renderer (Dual Mic Audio Tunnel - Mirrored Double-Sided Tube)
 
+  Receives compact audio frames from TWO XIAO RP2040s over designated UARTs.
+  Maps them to 12 double-sided strips arranged like clock numbers.
+  Features a randomized clock-face spatial window that restricts patterns to 
+  traveling through only 1, 2, or 3 strips at a time, skipping around unpredictably.
+*/
 
 #include <Arduino.h>
 #include <OctoWS2811.h>
@@ -101,6 +108,9 @@ MicEngine mic2;
 
 // ---------- Global Visual State ----------
 float flow = 0;
+float clockTrackAngle = 0.0f;     // Current location of the illuminated cluster mask
+float targetClockTrack = 0.0f;     // Where the mask is jumping next
+uint32_t lastRandomHopMs = 0;      // Hysteresis backup timer
 uint32_t lastFrameRenderMs = 0;
 
 // ---------- Helpers ----------
@@ -235,7 +245,7 @@ uint32_t addColor(uint32_t a, uint32_t b) {
 }
 
 // ---------- Render Math Engine ----------
-// Strict One-Way Progressive Fluid/Fire Propagation Engine with Helix Clock Offsets
+// Strict One-Way Progressive Fluid/Fire Propagation Engine with Randomized Clock Window
 uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float sideBias, float speedModifier) {
   float vol = mic.smVol / 255.0f;
   if (vol < 0.03f) return 0; // Absolute noise floor gate
@@ -243,8 +253,22 @@ uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float s
   float bass = mic.smBass / 255.0f;
   float mid = mic.smMid / 255.0f;
   float treble = mic.smTreble / 255.0f;
-  
-  // Dynamic Spectrum Cross-Fader calculation
+
+  // 1. RANDOMIZED SPATIAL WINDOW CALCULATION
+  // Evaluates circular loop delta relative to our jumpy coordinate tracking variable
+  float angularDiff = fabsf((float)strip - clockTrackAngle);
+  if (angularDiff > 6.0f) angularDiff = 12.0f - angularDiff;
+
+  // Window width clamps strictly to 1, 2, or 3 strips maximum (1.2 normal scale)
+  float allowedWidth = 1.2f + (treble * 0.8f);
+
+  if (angularDiff > allowedWidth) return 0;
+
+  // Generate smooth boundaries for the isolated randomized cluster strips
+  float windowFilter = 1.0f - (angularDiff / allowedWidth);
+  windowFilter = constrain(powf(windowFilter, 1.4f), 0.0f, 1.0f);
+
+  // 2. Dynamic Spectrum Cross-Fader calculation
   float totalEnergy = bass + mid + treble;
   uint8_t targetHue = (uint8_t)mic.smNoteHue;
   
@@ -255,21 +279,19 @@ uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float s
 
   float x = (float)targetPixel;
 
-  // !!! SPATIAL CLOCK OFFSET INTEGRATION !!!
-  // Creates a spiral corkscrew propagation that wraps around the 12 strips sequentially.
-  // High pitches increase the angular offset to make the helix tighter and more energetic.
-  float helixIntensity = 3.5f + (treble * 8.0f); 
+  // Helix Offset Multiplier
+  float helixIntensity = 3.5f + (treble * 4.0f); 
   float stripOffset = (float)strip * helixIntensity;
 
-  // One-way dynamic flow field phase logic incorporating the unique strip offset
+  // One-way dynamic flow field phase logic
   float phase = (flow * speedModifier) - (x * 0.45f) + stripOffset;
 
   // Continuous Emission Wave Layer (Fire movement simulation)
   float fireWaves = sinf(phase * 0.15f) * cosf(phase * 0.08f + strip);
-  fireWaves = (fireWaves * 0.5f) + 0.5f; // Normalize to 0.0f -> 1.0f range
-  fireWaves = powf(fireWaves, 2.0f);     // Sharpen up flame peaks
+  fireWaves = (fireWaves * 0.5f) + 0.5f; 
+  fireWaves = powf(fireWaves, 2.0f);     
 
-  // One-way Beat Impact Fronts (Also spiral-delayed based on clock position)
+  // One-way Beat Impact Fronts
   float beatVelocity = 2.5f; 
   float beatSamplePoint = (flow * beatVelocity) - (x * 0.60f) + (strip * 1.2f);
   float beatWave = sinf(beatSamplePoint * 0.1f);
@@ -288,12 +310,12 @@ uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float s
     sparkle = 0.0f;
   }
 
-  // Combine layers into a fluid driving coefficient
-  float intensity = (fireWaves * (0.35f + mid * 0.5f) + beatWave) * vol * 1.5f * structuralCooling;
-  intensity += sparkle;
+  // Combine layers into a fluid driving coefficient multiplied by our random layout window filter
+  float intensity = (fireWaves * (0.35f + mid * 0.5f) + beatWave) * vol * 1.5f * structuralCooling * windowFilter;
+  intensity += (sparkle * windowFilter);
 
   intensity = constrain(intensity, 0.0f, 1.0f);
-  intensity = powf(intensity, 1.3f); // Gamma filtering
+  intensity = powf(intensity, 1.3f); 
 
   if (intensity < 0.01f) return 0;
 
@@ -304,10 +326,10 @@ uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float s
 
   uint32_t c = hsvToRgb(finalHue, sat, val);
 
-  // Direct injection point flare (Offset based on strip position so the flare sparks in rotation)
+  // Direct injection point flare
   float adjustedX = x + (strip * 0.5f);
   if (adjustedX < 24.0f) {
-    float injectionGlow = (1.0f - (adjustedX / 24.0f)) * (bass * 0.6f + vol * 0.4f);
+    float injectionGlow = (1.0f - (adjustedX / 24.0f)) * (bass * 0.6f + vol * 0.4f) * windowFilter;
     uint32_t plasmaCore = hsvToRgb(targetHue - 8, 255, (uint8_t)(injectionGlow * 150));
     c = addColor(c, plasmaCore);
   }
@@ -326,6 +348,35 @@ void renderAudioTunnel() {
   flow += (1.2f + midAvg * 4.0f + bassAvg * 2.0f) * speedNormalization;
   if (flow > 200000.0f) flow = 0;
 
+  // !!! UNPREDICTABLE RANDOM HOP ENGINE !!!
+  uint32_t currentMs = millis();
+  bool instantHopTrigger = (mic1.audio.beat > 0 || mic2.audio.beat > 0);
+  bool quietTimeoutTrigger = (currentMs - lastRandomHopMs > 800);
+
+  // Jump to a new unpredictable target spot if a beat strikes or if it's been idle too long
+  if (instantHopTrigger || quietTimeoutTrigger) {
+    lastRandomHopMs = currentMs;
+    
+    // Pick an integer between 0 and 11 representing a completely random position around the circle
+    targetClockTrack = (float)random(0, NUM_STRIPS);
+    
+    // If it was triggered by a rapid beat, make the window jump instantly without sliding
+    if (instantHopTrigger) {
+      clockTrackAngle = targetClockTrack;
+    }
+  }
+
+  // Smoothly damp towards the random target coordinate to give it a fast fluid travel look
+  float approachDiff = targetClockTrack - clockTrackAngle;
+  if (approachDiff > 6.0f) approachDiff -= 12.0f;
+  if (approachDiff < -6.0f) approachDiff += 12.0f;
+
+  clockTrackAngle += approachDiff * (0.22f * speedNormalization);
+
+  // Wrap checking to handle seamless 360 loop boundaries
+  if (clockTrackAngle >= 12.0f) clockTrackAngle -= 12.0f;
+  if (clockTrackAngle < 0.0f) clockTrackAngle += 12.0f;
+
   float decayFactor = powf(0.85f, speedNormalization);
   mic1.beatPulse *= decayFactor;
   if (mic1.audio.beat > 0) mic1.beatPulse = 1.0f;
@@ -333,7 +384,6 @@ void renderAudioTunnel() {
   mic2.beatPulse *= decayFactor;
   if (mic2.audio.beat > 0) mic2.beatPulse = 1.0f;
 
-  uint32_t currentMs = millis();
   if (currentMs - mic1.lastFrameMs > 500) {
     mic1.smVol *= 0.85f; mic1.smBass *= 0.85f; mic1.smMid *= 0.85f; mic1.smTreble *= 0.85f;
   }
@@ -378,13 +428,10 @@ void printDualPacketDebug() {
   lastPacketDebugMs = now;
 
   Serial.print("[M1] Pkts:"); Serial.print(mic1.frameCounter);
-  Serial.print(" BadChks:"); Serial.print(mic1.badChecksumCounter);
   Serial.print(" Vol:"); Serial.print(mic1.audio.volume);
-  Serial.print(" Hue:"); Serial.print(mic1.audio.noteHue);
   Serial.print(" | [M2] Pkts:"); Serial.print(mic2.frameCounter);
-  Serial.print(" BadChks:"); Serial.print(mic2.badChecksumCounter);
   Serial.print(" Vol:"); Serial.print(mic2.audio.volume);
-  Serial.print(" Hue:"); Serial.println(mic2.audio.noteHue);
+  Serial.print(" | Random Active Cluster Strip: "); Serial.println(clockTrackAngle, 1);
 }
 
 // ---------- Smoothing Filters Variables Matrix ----------
@@ -428,8 +475,11 @@ void setup() {
   leds.begin();
   leds.show();
 
+  // Initialize random number generator using floating ambient analog noise
+  randomSeed(analogRead(38) + analogRead(39));
+
   if (VERBOSE) {
-    Serial.print("\nTeensy Absolute Unidirectional Fluid/Fire Renderer Started @ ");
+    if (VERBOSE) Serial.println("\nTeensy Absolute Unidirectional Fluid/Fire Renderer Started @ ");
     Serial.print(TARGET_FPS);
     Serial.println(" FPS");
   }

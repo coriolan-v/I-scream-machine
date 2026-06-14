@@ -42,10 +42,19 @@ static constexpr int NUM_LEDS = NUM_STRIPS * LEDS_PER_STRIP;
 
 static constexpr uint32_t UART_BAUD = 460800;
 
-byte pinList[NUM_STRIPS] = {  
-  33, 34, 35, 36,
-  37, 38, 39, 40,
-  18, 19, 20, 21
+byte pinList[NUM_STRIPS] = {
+  21, // Strip 1  (was 12)
+  18, // Strip 2  (was 9)
+  19, // Strip 3  (was 10)
+  20, // Strip 4  (was 11)
+  36, // Strip 5  (was 4)
+  38, // Strip 6  (was 6)
+  33, // Strip 7  (was 1)
+  37, // Strip 8  (was 5)
+  34, // Strip 9  (was 2)
+  35, // Strip 10 (was 3)
+  40, // Strip 11 (was 8)
+  39  // Strip 12 (was 7)
 };
 const int bytesPerLED = 3;
 
