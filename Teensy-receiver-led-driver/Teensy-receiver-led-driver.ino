@@ -232,9 +232,11 @@ uint32_t addColor(uint32_t a, uint32_t b) {
 }
 
 // ---------- Render Math Engine ----------
-// Evaluates the math for a single engine pass relative to its launching end
+// Strict One-Way Progressive Fluid/Fire Propagation Engine
 uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float sideBias, float speedModifier) {
   float vol = mic.smVol / 255.0f;
+  if (vol < 0.03f) return 0; // Absolute noise floor gate
+
   float bass = mic.smBass / 255.0f;
   float mid = mic.smMid / 255.0f;
   float treble = mic.smTreble / 255.0f;
@@ -242,57 +244,57 @@ uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float s
 
   float x = (float)targetPixel;
 
-  float activeLen = 4.0f + powf(vol, 0.65f) * (SIDE_LEDS - 4);
-  float waveWidth = 4.0f + bass * 25.0f;
-  float sparkleAmount = treble;
+  // 1. One-way dynamic flow field phase logic
+  // Tracking spatial position subtracted from global flow creates an absolute forward-only vector force.
+  float phase = (flow * speedModifier) - (x * 0.45f) + (strip * 2.5f);
 
-  float edge = activeLen - x;
-  float bar = constrain(edge / 12.0f, 0.0f, 1.0f);
+  // 2. Continuous Emission Wave Layer (Fire movement simulation)
+  float fireWaves = sinf(phase * 0.15f) * cosf(phase * 0.08f + strip);
+  fireWaves = (fireWaves * 0.5f) + 0.5f; // Normalize to 0.0f -> 1.0f range
+  fireWaves = powf(fireWaves, 2.0f);     // Sharpen up flame peaks
 
-  float wavePos = fmodf(flow * speedModifier + strip * 13.0f, SIDE_LEDS + waveWidth * 2.0f) - waveWidth;
-  float d = fabsf(x - wavePos);
-  float wave = max(0.0f, 1.0f - d / waveWidth);
-  wave = wave * wave;
+  // 3. One-way Beat Impact Fronts
+  // Beats inject a bright pulse traveling sequentially from 0 down to 191
+  float beatVelocity = 2.5f; 
+  float beatSamplePoint = (flow * beatVelocity) - (x * 0.60f);
+  float beatWave = sinf(beatSamplePoint * 0.1f);
+  beatWave = max(0.0f, beatWave) * mic.beatPulse * 1.5f;
 
-  float wavePos2 = SIDE_LEDS - wavePos;
-  float d2 = fabsf(x - wavePos2);
-  float wave2 = max(0.0f, 1.0f - d2 / (waveWidth * 1.4f));
-  wave2 = wave2 * wave2 * 0.6f;
+  // 4. Natural Tail Fade dissipation across the 2-meter physical strip length
+  // Emitted energy naturally vaporizes/cools down as it approaches the far termination end.
+  float structuralCooling = 1.0f - (x / (float)SIDE_LEDS);
+  structuralCooling = constrain(structuralCooling, 0.0f, 1.0f);
 
-  float beatPos = (1.0f - mic.beatPulse) * SIDE_LEDS;
-  float beatD = fabsf(x - beatPos);
-  float beatGlow = max(0.0f, 1.0f - beatD / 15.0f) * mic.beatPulse;
-
-  uint32_t hash = (uint32_t)(targetPixel * 1103515245UL + strip * 12345UL + (uint32_t)(flow * 17));
+  // 5. Treble Sparkle Dust 
+  uint32_t hash = (uint32_t)(targetPixel * 1103515245UL + strip * 76543UL + (uint32_t)(flow * 0.5f));
   float sparkle = ((hash >> 24) & 0xFF) / 255.0f;
-  if (sparkle > (0.985f - sparkleAmount * 0.06f)) {
-    sparkle = sparkleAmount;
+  if (sparkle > (0.988f - treble * 0.05f)) {
+    sparkle = treble * structuralCooling * 0.8f;
   } else {
     sparkle = 0.0f;
   }
 
-  float intensity = bar * 0.70f + wave * (0.25f + mid * 0.45f) + wave2 * 0.25f + beatGlow * 1.2f + sparkle * 0.8f;
-
-  if (vol < 0.04f) {
-    intensity = 0.0f;
-  }
+  // Combine layers into a fluid driving coefficient
+  float intensity = (fireWaves * (0.35f + mid * 0.5f) + beatWave) * vol * 1.5f * structuralCooling;
+  intensity += sparkle;
 
   intensity = constrain(intensity, 0.0f, 1.0f);
-  intensity = powf(intensity, 1.35f);
+  intensity = powf(intensity, 1.3f); // Gamma filtering
 
-  uint8_t hue = baseHue + strip * 2 + targetPixel * 0.06f + sideBias * 6.0f;
-  uint8_t sat = 235;
+  if (intensity < 0.01f) return 0;
+
+  // Modulate color dynamically across the physical length
+  uint8_t hue = baseHue + (targetPixel * 0.25f) + (strip * 2) + (sideBias * 5.0f);
+  uint8_t sat = 245 - (bass * 20); // Saturate slightly based on tracking low-frequency
   uint8_t val = (uint8_t)(intensity * 255.0f);
 
   uint32_t c = hsvToRgb(hue, sat, val);
 
-  if (bass > 0.15f && x < activeLen * 0.55f && vol >= 0.04f) {
-    uint32_t warm = hsvToRgb(baseHue, 240, (uint8_t)(bass * 120));
-    c = addColor(c, scaleColor(warm, 0.35f));
-  }
-
-  if (beatGlow > 0.01f && vol >= 0.04f) {
-    c = addColor(c, rgb((uint8_t)(beatGlow * 180), (uint8_t)(beatGlow * 180), (uint8_t)(beatGlow * 180)));
+  // Direct injection point flare (Intense hot glow localized strictly at the starting edge)
+  if (x < 24.0f) {
+    float injectionGlow = (1.0f - (x / 24.0f)) * (bass * 0.6f + vol * 0.4f);
+    uint32_t plasmaCore = hsvToRgb(baseHue - 10, 255, (uint8_t)(injectionGlow * 150));
+    c = addColor(c, plasmaCore);
   }
 
   return c;
@@ -304,11 +306,12 @@ void renderAudioTunnel() {
   float bassAvg = (mic1.smBass + mic2.smBass) / 510.0f;
   
   float speedNormalization = 60.0f / (float)TARGET_FPS;
-  flow += (0.35f + midAvg * 2.3f + bassAvg * 0.8f) * speedNormalization;
+  
+  // Continuous progression accumulation variable
+  flow += (1.2f + midAvg * 4.0f + bassAvg * 2.0f) * speedNormalization;
+  if (flow > 200000.0f) flow = 0;
 
-  if (flow > 100000.0f) flow = 0;
-
-  float decayFactor = powf(0.88f, speedNormalization);
+  float decayFactor = powf(0.85f, speedNormalization);
   mic1.beatPulse *= decayFactor;
   if (mic1.audio.beat > 0) mic1.beatPulse = 1.0f;
 
@@ -325,27 +328,47 @@ void renderAudioTunnel() {
 
   for (int s = 0; s < NUM_STRIPS; s++) {
     float stripPhase = (float)s / NUM_STRIPS;
-    float sideBias = sinf(stripPhase * TWO_PI + flow * 0.015f) * 0.5f + 0.5f;
+    float sideBias = sinf(stripPhase * TWO_PI + flow * 0.01f) * 0.5f + 0.5f;
 
-    // Run spatial calculations sequentially down the full 2m length
     for (int p = 0; p < SIDE_LEDS; p++) {
       
-      // Mic 1: Starts at physical Pixel 0, travels to 191
+      // Mic 1: Evaluates step distance 'p' from physical pixel 0 down to 191
       uint32_t colorM1 = computePatternColor(s, p, mic1, sideBias, 1.0f);
 
-      // Mic 2: Starts at physical Pixel 191, travels down to 0
-      int mic2InvertedPixel = (SIDE_LEDS - 1) - p;
-      uint32_t colorM2 = computePatternColor(s, mic2InvertedPixel, mic2, sideBias, 0.9f);
+      // Mic 2: Evaluates step distance 'p' from physical pixel 191 down to 0
+      uint32_t colorM2 = computePatternColor(s, p, mic2, sideBias, 0.95f);
 
-      // Clean additive blend so they cross paths perfectly
-      uint32_t blendedColor = addColor(colorM1, colorM2);
+      // Non-interfering clean additive blend over shared physical indices
+      int mic2PhysicalIndex = (SIDE_LEDS - 1) - p;
+      
+      // We read current state of layout safely to merge the overlapping outputs
+      uint32_t colorM1_Target = colorM1;
+      
+      // For pixel mapping compilation, merge calculations over unified layout spectrum
+      // We handle the spatial coordinate mapping cleanly here
+      
+      // Let's create an independent buffer write sequence to avoid asymmetric assignment artifacts:
+      // We can directly compile the absolute buffer assignments per pixel index:
+    }
+    
+    // Optimized spatial mapper loop pass
+    for (int p = 0; p < SIDE_LEDS; p++) {
+      // Get the forward emission color from Mic 1 (starts at 0, moves right)
+      uint32_t c1 = computePatternColor(s, p, mic1, sideBias, 1.0f);
+      
+      // Get the forward emission color from Mic 2 (starts at 191, moves left)
+      int m2Distance = (SIDE_LEDS - 1) - p; 
+      uint32_t c2 = computePatternColor(s, m2Distance, mic2, sideBias, 0.95f);
 
-      // Assign to physical outside strip layout
-      leds.setPixel(ledIndex(s, p), scaleColor(blendedColor, OUTSIDE_BRIGHTNESS));
+      // Smooth additive pass over the physical layout map
+      uint32_t finalOutsideColor = addColor(c1, c2);
 
-      // Mirror onto inside loop with full spatial inversion
+      // Write direct to outside layer
+      leds.setPixel(ledIndex(s, p), scaleColor(finalOutsideColor, OUTSIDE_BRIGHTNESS));
+
+      // Inverse mirror assignment direct to inside layer
       int insidePixel = SIDE_LEDS + (SIDE_LEDS - 1 - p);
-      leds.setPixel(ledIndex(s, insidePixel), scaleColor(blendedColor, INSIDE_BRIGHTNESS));
+      leds.setPixel(ledIndex(s, insidePixel), scaleColor(finalOutsideColor, INSIDE_BRIGHTNESS));
     }
   }
 
@@ -410,7 +433,7 @@ void setup() {
   leds.show();
 
   if (VERBOSE) {
-    Serial.print("\nTeensy Dual-End Full-Travel Additive Blended Renderer Started @ ");
+    Serial.print("\nTeensy Absolute Unidirectional Fluid/Fire Renderer Started @ ");
     Serial.print(TARGET_FPS);
     Serial.println(" FPS");
   }
