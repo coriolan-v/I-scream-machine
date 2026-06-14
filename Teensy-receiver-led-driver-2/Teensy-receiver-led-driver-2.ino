@@ -3,8 +3,11 @@
 
   Receives compact audio frames from TWO XIAO RP2040s over designated UARTs.
   Maps them to 12 double-sided strips arranged like clock numbers.
-  Features a randomized clock-face spatial window that restricts patterns to 
-  traveling through only 1, 2, or 3 strips at a time, skipping around unpredictably.
+  
+  INTELLIGENT LATCH ENGINE:
+  Alternates dynamically between Global Tunnel Mode and Randomized Cluster Mode,
+  as well as jumping between clock strips, BUT locks execution changes until 
+  the current energy packet clears the tube length to prevent mid-travel shearing.
 */
 
 #include <Arduino.h>
@@ -40,7 +43,7 @@ static constexpr int NUM_LEDS = NUM_STRIPS * LEDS_PER_STRIP;
 
 static constexpr uint32_t UART_BAUD = 460800;
 
-// Teensy LED pins
+// Teensy LED pins (Preserved custom layout sequence mapping)
 byte pinList[NUM_STRIPS] = {
   21, // Strip 1  (was 12)
   18, // Strip 2  (was 9)
@@ -106,11 +109,24 @@ struct MicEngine {
 MicEngine mic1;
 MicEngine mic2;
 
+// ---------- Global Layout Architecture Modes ----------
+enum RenderMode {
+  TUNNEL_MODE,    // All 12 strips active
+  CLUSTER_MODE    // Isolated 1, 2, or 3 strips active
+};
+
+RenderMode currentMode = TUNNEL_MODE;
+RenderMode pendingMode = TUNNEL_MODE; // Latched state holder
+bool modeChangePending = false;
+
+uint32_t lastModeSwitchMs = 0;
+uint32_t modeDurationMs = 5000;  // Random window boundary tracking holder (30-50s)
+
 // ---------- Global Visual State ----------
 float flow = 0;
-float clockTrackAngle = 0.0f;     // Current location of the illuminated cluster mask
-float targetClockTrack = 0.0f;     // Where the mask is jumping next
-uint32_t lastRandomHopMs = 0;      // Hysteresis backup timer
+float clockTrackAngle = 0.0f;     
+float targetClockTrack = 0.0f;     
+uint32_t lastRandomHopMs = 0;      
 uint32_t lastFrameRenderMs = 0;
 
 // ---------- Helpers ----------
@@ -245,7 +261,6 @@ uint32_t addColor(uint32_t a, uint32_t b) {
 }
 
 // ---------- Render Math Engine ----------
-// Strict One-Way Progressive Fluid/Fire Propagation Engine with Randomized Clock Window
 uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float sideBias, float speedModifier) {
   float vol = mic.smVol / 255.0f;
   if (vol < 0.03f) return 0; // Absolute noise floor gate
@@ -254,19 +269,19 @@ uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float s
   float mid = mic.smMid / 255.0f;
   float treble = mic.smTreble / 255.0f;
 
-  // 1. RANDOMIZED SPATIAL WINDOW CALCULATION
-  // Evaluates circular loop delta relative to our jumpy coordinate tracking variable
-  float angularDiff = fabsf((float)strip - clockTrackAngle);
-  if (angularDiff > 6.0f) angularDiff = 12.0f - angularDiff;
+  // 1. CONDITIONAL MODE OVERRIDE FILTER
+  float windowFilter = 1.0f;
 
-  // Window width clamps strictly to 1, 2, or 3 strips maximum (1.2 normal scale)
-  float allowedWidth = 1.2f + (treble * 0.8f);
+  if (currentMode == CLUSTER_MODE) {
+    float angularDiff = fabsf((float)strip - clockTrackAngle);
+    if (angularDiff > 6.0f) angularDiff = 12.0f - angularDiff;
 
-  if (angularDiff > allowedWidth) return 0;
+    float allowedWidth = 1.2f + (treble * 0.8f);
+    if (angularDiff > allowedWidth) return 0;
 
-  // Generate smooth boundaries for the isolated randomized cluster strips
-  float windowFilter = 1.0f - (angularDiff / allowedWidth);
-  windowFilter = constrain(powf(windowFilter, 1.4f), 0.0f, 1.0f);
+    windowFilter = 1.0f - (angularDiff / allowedWidth);
+    windowFilter = constrain(powf(windowFilter, 1.4f), 0.0f, 1.0f);
+  }
 
   // 2. Dynamic Spectrum Cross-Fader calculation
   float totalEnergy = bass + mid + treble;
@@ -310,7 +325,7 @@ uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float s
     sparkle = 0.0f;
   }
 
-  // Combine layers into a fluid driving coefficient multiplied by our random layout window filter
+  // Combine layers into a fluid driving coefficient multiplied by mode architecture filter
   float intensity = (fireWaves * (0.35f + mid * 0.5f) + beatWave) * vol * 1.5f * structuralCooling * windowFilter;
   intensity += (sparkle * windowFilter);
 
@@ -341,6 +356,7 @@ uint32_t computePatternColor(int strip, int targetPixel, MicEngine &mic, float s
 void renderAudioTunnel() {
   float midAvg = (mic1.smMid + mic2.smMid) / 510.0f;
   float bassAvg = (mic1.smBass + mic2.smBass) / 510.0f;
+  float volAvg = (mic1.smVol + mic2.smVol) / 510.0f;
   
   float speedNormalization = 60.0f / (float)TARGET_FPS;
   
@@ -348,35 +364,59 @@ void renderAudioTunnel() {
   flow += (1.2f + midAvg * 4.0f + bassAvg * 2.0f) * speedNormalization;
   if (flow > 200000.0f) flow = 0;
 
-  // !!! UNPREDICTABLE RANDOM HOP ENGINE !!!
   uint32_t currentMs = millis();
-  bool instantHopTrigger = (mic1.audio.beat > 0 || mic2.audio.beat > 0);
-  bool quietTimeoutTrigger = (currentMs - lastRandomHopMs > 800);
 
-  // Jump to a new unpredictable target spot if a beat strikes or if it's been idle too long
-  if (instantHopTrigger || quietTimeoutTrigger) {
-    lastRandomHopMs = currentMs;
+  // !!! INTERLOCKING TIMING SCHEDULER MATRIX !!!
+  if (!modeChangePending && (currentMs - lastModeSwitchMs >= modeDurationMs)) {
+    // Flag that we want to swap modes, but do not update currentMode yet
+    modeChangePending = true;
+    pendingMode = (currentMode == TUNNEL_MODE) ? CLUSTER_MODE : TUNNEL_MODE;
+  }
+
+  // Safe Latch Verification: Only execute pending swaps during audio pauses/zero-energy crossings
+  if (modeChangePending && (volAvg < 0.05f)) {
+    currentMode = pendingMode;
+    modeChangePending = false;
+    lastModeSwitchMs = currentMs;
+    modeDurationMs = (uint32_t)random(30000, 50001); // 30 to 50 seconds next sequence frame
     
-    // Pick an integer between 0 and 11 representing a completely random position around the circle
-    targetClockTrack = (float)random(0, NUM_STRIPS);
-    
-    // If it was triggered by a rapid beat, make the window jump instantly without sliding
-    if (instantHopTrigger) {
-      clockTrackAngle = targetClockTrack;
+    if (VERBOSE) {
+      if (currentMode == CLUSTER_MODE) Serial.println("\n[LATCHED] Swapped safely to CLUSTER MODE");
+      else Serial.println("\n[LATCHED] Swapped safely to ALL-STRIP TUNNEL MODE");
     }
   }
 
-  // Smoothly damp towards the random target coordinate to give it a fast fluid travel look
+  // !!! PROTECTED SPATIAL RANDOM TRACK JUMPING !!!
+  bool beatDetected = (mic1.audio.beat > 0 || mic2.audio.beat > 0);
+  bool quietTimeout = (currentMs - lastRandomHopMs > 1200);
+
+  if (beatDetected || quietTimeout) {
+    // Sharp beat triggers or quiet timeouts flag a new target location, but do not snap instantly mid-wave
+    float proposedTarget = (float)random(0, NUM_STRIPS);
+    
+    // Only snap or shift targets if current pipeline calculations are quiet
+    if (volAvg < 0.08f || quietTimeout) {
+      targetClockTrack = proposedTarget;
+      lastRandomHopMs = currentMs;
+      
+      // If a major drum beat hits during a quiet pocket, snap the tracker instantly
+      if (beatDetected && volAvg < 0.04f) {
+        clockTrackAngle = targetClockTrack;
+      }
+    }
+  }
+
+  // Smooth architectural approach calculations
   float approachDiff = targetClockTrack - clockTrackAngle;
   if (approachDiff > 6.0f) approachDiff -= 12.0f;
   if (approachDiff < -6.0f) approachDiff += 12.0f;
 
-  clockTrackAngle += approachDiff * (0.22f * speedNormalization);
+  clockTrackAngle += approachDiff * (0.18f * speedNormalization);
 
-  // Wrap checking to handle seamless 360 loop boundaries
   if (clockTrackAngle >= 12.0f) clockTrackAngle -= 12.0f;
   if (clockTrackAngle < 0.0f) clockTrackAngle += 12.0f;
 
+  // Handle pulse dampening
   float decayFactor = powf(0.85f, speedNormalization);
   mic1.beatPulse *= decayFactor;
   if (mic1.audio.beat > 0) mic1.beatPulse = 1.0f;
@@ -395,22 +435,16 @@ void renderAudioTunnel() {
     float stripPhase = (float)s / NUM_STRIPS;
     float sideBias = sinf(stripPhase * TWO_PI + flow * 0.01f) * 0.5f + 0.5f;
     
-    // Optimized spatial mapper loop pass
     for (int p = 0; p < SIDE_LEDS; p++) {
-      // Get the forward emission color from Mic 1 (starts at 0, moves right)
       uint32_t c1 = computePatternColor(s, p, mic1, sideBias, 1.0f);
       
-      // Get the forward emission color from Mic 2 (starts at 191, moves left)
       int m2Distance = (SIDE_LEDS - 1) - p; 
       uint32_t c2 = computePatternColor(s, m2Distance, mic2, sideBias, 0.95f);
 
-      // Smooth additive pass over the physical layout map
       uint32_t finalOutsideColor = addColor(c1, c2);
 
-      // Write direct to outside layer
       leds.setPixel(ledIndex(s, p), scaleColor(finalOutsideColor, OUTSIDE_BRIGHTNESS));
 
-      // Inverse mirror assignment direct to inside layer
       int insidePixel = SIDE_LEDS + (SIDE_LEDS - 1 - p);
       leds.setPixel(ledIndex(s, insidePixel), scaleColor(finalOutsideColor, INSIDE_BRIGHTNESS));
     }
@@ -431,7 +465,14 @@ void printDualPacketDebug() {
   Serial.print(" Vol:"); Serial.print(mic1.audio.volume);
   Serial.print(" | [M2] Pkts:"); Serial.print(mic2.frameCounter);
   Serial.print(" Vol:"); Serial.print(mic2.audio.volume);
-  Serial.print(" | Random Active Cluster Strip: "); Serial.println(clockTrackAngle, 1);
+  
+  Serial.print(" | Mode: ");
+  if (modeChangePending) Serial.print("[PENDING SWAP]");
+  else if (currentMode == TUNNEL_MODE) Serial.print("GLOBAL TUNNEL");
+  else Serial.print("SPATIAL CLUSTER");
+  
+  Serial.print(" | Target Track: ");
+  Serial.println(targetClockTrack, 1);
 }
 
 // ---------- Smoothing Filters Variables Matrix ----------
@@ -475,17 +516,17 @@ void setup() {
   leds.begin();
   leds.show();
 
-  // Initialize random number generator using floating ambient analog noise
   randomSeed(analogRead(38) + analogRead(39));
 
   if (VERBOSE) {
-    if (VERBOSE) Serial.println("\nTeensy Absolute Unidirectional Fluid/Fire Renderer Started @ ");
+    Serial.print("\nTeensy Absolute Unidirectional Fluid/Fire Renderer Started @ ");
     Serial.print(TARGET_FPS);
     Serial.println(" FPS");
   }
 
   startupLedTest();
   lastFrameRenderMs = millis();
+  lastModeSwitchMs = millis();
 }
 
 // ---------- Main Execution Processing Loop ----------
