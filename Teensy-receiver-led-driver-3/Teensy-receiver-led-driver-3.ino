@@ -1,10 +1,19 @@
 
 /*
   Teensy 4.1 LED renderer (Dual Mic Audio Tunnel - Mirrored Double-Sided Tube)
+
+  Receives compact audio frames from TWO XIAO RP2040s over designated UARTs.
+  Maps them to 12 double-sided strips arranged like clock numbers.
   
-  ANTI-TRANSIENT UPDATE:
-  - Added Vocal Confirmation Windowing to ignore short clicks/door slams.
-  - Added asymmetric slew rate limits to prevent immediate flash spikes on sudden room noise.
+  INTELLIGENT DUAL-MIC INTERACTION ENGINE:
+  - Higher volume microphone dynamically wins dominance over the tube.
+  - When opposing traveling waves meet on a physical pixel, a localized 
+    white flash/sparkle is generated at the exact collision point.
+  - Retains the glitch-free latched cluster state machine to prevent mid-air shearing.
+
+  IDLE ANIMATION UPDATE:
+  - Automatically switches to a soft sweeping glow across the 12 strips after 5 seconds of absolute silence.
+  - Instantly wakes back up to normal mode the moment any microphone registers audio.
 */
 
 #include <Arduino.h>
@@ -17,6 +26,11 @@ static constexpr uint32_t FRAME_PERIOD_MS = 1000 / TARGET_FPS;
 // ---------- Dual Brightness Configuration ----------
 static constexpr float OUTSIDE_BRIGHTNESS = 1.0f; 
 static constexpr float INSIDE_BRIGHTNESS  = 0.5f; 
+
+// ---------- Idle Animation Configuration ----------
+static constexpr uint32_t IDLE_TIMEOUT_MS = 5000;   // 5 seconds timeout
+static constexpr int IDLE_PIXEL_LIMIT = 12;         // Limit animation to the first dozen pixels
+static constexpr float IDLE_SWEEP_SPEED = 0.02f;    // Traveling wave tracking index speed
 
 // ---------- Dual UART Configuration ----------
 #define MIC1_SERIAL Serial7   
@@ -81,18 +95,10 @@ struct MicEngine {
   float smTreble = 0;
   float smNoteHue = 0;
   float beatPulse = 0;
-
-  // --- Anti-Transient Tracker Variables ---
-  uint16_t sustainedFrames = 0; 
-  float targetVolProcessed = 0;
 };
 
 MicEngine mic1;
 MicEngine mic2;
-
-// --- Anti-Transient Config Tuning Parameters ---
-static constexpr uint16_t DEBOUNCE_CONFIRM_FRAMES = 3; // Must be loud for ~50ms to count as vocal
-static constexpr float MAX_VOL_ATTACK_STEP = 35.0f;     // Maximum volume delta increase allowed per frame
 
 enum RenderMode {
   TUNNEL_MODE,    
@@ -111,6 +117,8 @@ float clockTrackAngle = 0.0f;
 float targetClockTrack = 0.0f;     
 uint32_t lastRandomHopMs = 0;      
 uint32_t lastFrameRenderMs = 0;
+uint32_t lastAudioActivityMs = 0;   // Track time since last audio packet volume > 0
+float idleTracker = 0.0f;           // Keeps track of the sweeping hand angle
 
 // ---------- Helpers ----------
 uint8_t checksumFrame(uint8_t *f, int n) {
@@ -246,6 +254,62 @@ float getWaveIntensity(int strip, int targetPixel, MicEngine &mic, float speedMo
   return intensity;
 }
 
+// ---------- Traveling Ambient Idle Animation Engine ----------
+// ---------- Traveling Ambient Idle Animation Engine ----------
+void renderIdleState() {
+  float speedNormalization = 60.0f / (float)TARGET_FPS;
+  idleTracker += IDLE_SWEEP_SPEED * speedNormalization;
+  if (idleTracker >= 12.0f) idleTracker -= 12.0f;
+
+  // Slowly shifting rainbow base hue
+  uint8_t cyclicHue = (uint8_t)((millis() / 60) % 256);
+
+  for (int s = 0; s < NUM_STRIPS; s++) {
+    // Angular distance calculation from the traveling sweep position
+    float angularDiff = fabsf((float)s - idleTracker);
+    if (angularDiff > 6.0f) angularDiff = 12.0f - angularDiff;
+
+    // Bell curve layout intensity based on proximity to the active clock angle hand
+    float stripGlow = max(0.0f, 1.0f - (angularDiff / 2.0f));
+    stripGlow = stripGlow * stripGlow; 
+
+    for (int p = 0; p < SIDE_LEDS; p++) {
+      float lengthCooling = 0.0f;
+      bool isAnimateZone = false;
+
+      // ZONE 1: Mic 1 Physical Entrance (First dozen pixels)
+      if (p < IDLE_PIXEL_LIMIT) {
+        lengthCooling = 1.0f - ((float)p / (float)IDLE_PIXEL_LIMIT);
+        isAnimateZone = true;
+      } 
+      // ZONE 2: Mic 2 Physical Entrance (Last dozen pixels)
+      else if (p >= (SIDE_LEDS - IDLE_PIXEL_LIMIT)) {
+        int distanceFromEnd = (SIDE_LEDS - 1) - p;
+        lengthCooling = 1.0f - ((float)distanceFromEnd / (float)IDLE_PIXEL_LIMIT);
+        isAnimateZone = true;
+      }
+
+      // Symmetrical Render Execution Pass
+      if (isAnimateZone) {
+        float combinedScalar = stripGlow * lengthCooling * 0.6f; 
+        uint32_t color = hsvToRgb(cyclicHue + (s * 4), 220, (uint8_t)(combinedScalar * 255.0f));
+
+        // Assign to outside line entry path
+        leds.setPixel(ledIndex(s, p), scaleColor(color, OUTSIDE_BRIGHTNESS));
+        // Assign directly to inside mirrored entry path
+        int insidePixel = SIDE_LEDS + (SIDE_LEDS - 1 - p);
+        leds.setPixel(ledIndex(s, insidePixel), scaleColor(color, INSIDE_BRIGHTNESS));
+      } else {
+        // Blank out remaining downstream core pixels to ensure rest state
+        leds.setPixel(ledIndex(s, p), 0);
+        int insidePixel = SIDE_LEDS + (SIDE_LEDS - 1 - p);
+        leds.setPixel(ledIndex(s, insidePixel), 0);
+      }
+    }
+  }
+  leds.show();
+}
+
 void renderAudioTunnel() {
   float v1 = mic1.smVol / 255.0f;
   float v2 = mic2.smVol / 255.0f;
@@ -286,7 +350,6 @@ void renderAudioTunnel() {
     mic2.smVol *= 0.85f; mic2.smBass *= 0.85f; mic2.smMid *= 0.85f; mic2.smTreble *= 0.85f;
   }
 
-  // --- HARD ACOUSTIC DOMINANCE & DIRECTION ENGINE ---
   float mic1Dominance = 0.0f;
   float mic2Dominance = 0.0f;
   
@@ -311,7 +374,6 @@ void renderAudioTunnel() {
     }
   }
 
-  // ---------- LED Renderer Pass ----------
   for (int s = 0; s < NUM_STRIPS; s++) {
     float windowFilter = 1.0f;
     if (currentMode == CLUSTER_MODE) {
@@ -367,58 +429,30 @@ void printDualPacketDebug() {
   Serial.print("[M1] Vol:"); Serial.print(mic1.audio.volume);
   Serial.print(" [M2] Vol:"); Serial.print(mic2.audio.volume);
   Serial.print(" | Active Mode: ");
-  Serial.print(currentMode == TUNNEL_MODE ? "TUNNEL" : "CLUSTER");
+  if (now - lastAudioActivityMs >= IDLE_TIMEOUT_MS) {
+    Serial.print("GLOW-IDLE");
+  } else {
+    Serial.print(currentMode == TUNNEL_MODE ? "TUNNEL" : "CLUSTER");
+  }
   Serial.print(" | Track Center: ");
   Serial.println(clockTrackAngle, 1);
 }
 
-// ---------- Smart Anti-Transient Smoothing Engine ----------
 void applySmoothingFilters(MicEngine &mic) {
   float speedNormalization = 60.0f / (float)TARGET_FPS;
-  
-  // 1. VOCAL CONFIRMATION GATE (Debouncer)
-  // If incoming raw volume crosses an operational threshold, test it over consecutive frames.
-  if (mic.audio.volume > 35) {
-    mic.sustainedFrames++;
-  } else {
-    if (mic.sustainedFrames > 0) mic.sustainedFrames--;
-  }
-
-  // Assign internal processed target based on whether noise has outlasted transient limits
-  if (mic.sustainedFrames >= DEBOUNCE_CONFIRM_FRAMES) {
-    mic.targetVolProcessed = (float)mic.audio.volume;
-  } else {
-    mic.targetVolProcessed = 0.0f; // Discard short clicks completely
-  }
-
-  // 2. ASYMMETRIC SLEW LIMITER (Limits rate of lighting explosion)
-  float volDelta = mic.targetVolProcessed - mic.smVol;
-  if (volDelta > 0) {
-    // Going up: Clamp max step size to suppress fast room slaps
-    if (volDelta > MAX_VOL_ATTACK_STEP) volDelta = MAX_VOL_ATTACK_STEP;
-    mic.smVol += volDelta;
-  } else {
-    // Going down: Fall away at standard responsive exponential rate
-    float vSmooth = 1.0f - (0.24f * speedNormalization);
-    mic.smVol = mic.smVol * vSmooth + mic.targetVolProcessed * (1.0f - vSmooth);
-  }
-
-  // Standard Exponential Filter for Frequency Sub-bands
+  float vSmooth = 1.0f - (0.18f * speedNormalization);
   float bmtSmooth = 1.0f - (0.22f * speedNormalization);
   float hSmooth = 1.0f - (0.15f * speedNormalization);
 
-  mic.smBass   = mic.smBass   * bmtSmooth + mic.audio.bass   * (1.0f - bmtSmooth);
-  mic.smMid    = mic.smMid    * bmtSmooth + mic.audio.mid    * (1.0f - bmtSmooth);
-  mic.smTreble = mic.smTreble * bmtSmooth + mic.audio.treble * (1.0f - bmtSmooth);
-  mic.smNoteHue = mic.smNoteHue * hSmooth + mic.audio.noteHue * (1.0f - hSmooth);
+  mic.smVol = mic.smVol * constrain(vSmooth, 0.1f, 0.95f) + mic.audio.volume * (1.0f - constrain(vSmooth, 0.1f, 0.95f));
+  mic.smBass = mic.smBass * constrain(bmtSmooth, 0.1f, 0.95f) + mic.audio.bass * (1.0f - constrain(bmtSmooth, 0.1f, 0.95f));
+  mic.smMid = mic.smMid * constrain(bmtSmooth, 0.1f, 0.95f) + mic.audio.mid * (1.0f - constrain(bmtSmooth, 0.1f, 0.95f));
+  mic.smTreble = mic.smTreble * constrain(bmtSmooth, 0.1f, 0.95f) + mic.audio.treble * (1.0f - constrain(bmtSmooth, 0.1f, 0.95f));
+  mic.smNoteHue = mic.smNoteHue * constrain(hSmooth, 0.1f, 0.95f) + mic.audio.noteHue * (1.0f - constrain(hSmooth, 0.1f, 0.95f));
 
-  // Complete blackout handling
-  if (mic.targetVolProcessed == 0.0f) {
-    mic.smVol *= 0.60f; 
-    mic.smBass *= 0.60f; 
-    mic.smMid *= 0.60f; 
-    mic.smTreble *= 0.60f;
-    if (mic.smVol < 2.0f) {
+  if (mic.audio.volume == 0) {
+    mic.smVol *= 0.50f; mic.smBass *= 0.50f; mic.smMid *= 0.50f; mic.smTreble *= 0.50f;
+    if (mic.smVol < 3.0f) {
       mic.smVol = 0.0f; mic.smBass = 0.0f; mic.smMid = 0.0f; mic.smTreble = 0.0f;
     }
   }
@@ -445,20 +479,37 @@ void setup() {
   
   lastFrameRenderMs = millis();
   lastModeSwitchMs = millis();
+  lastAudioActivityMs = millis(); // Initialize activity tracker
 }
 
 void loop() {
+  // 1. Drain the serial ports as fast as hardware allows
   while (readAudioFrame(MIC1_SERIAL, mic1)) {}
   while (readAudioFrame(MIC2_SERIAL, mic2)) {}
 
   uint32_t currentMs = millis();
-  if (currentMs - lastFrameRenderMs >= FRAME_PERIOD_MS) {
-    lastFrameRenderMs = currentMs;
-    applySmoothingFilters(mic1);
-    applySmoothingFilters(mic2);
-    renderAudioTunnel();
+
+  // 2. Direct Wake Engine: Keep resetting the activity tracker if audio registers on either line
+  if (mic1.audio.volume > 0 || mic2.audio.volume > 0) {
+    lastAudioActivityMs = currentMs;
   }
 
+  // 3. Fixed Frame-Rate Rendering Gate (Runs at your TARGET_FPS clock)
+  if (currentMs - lastFrameRenderMs >= FRAME_PERIOD_MS) {
+    lastFrameRenderMs = currentMs;
+
+    // Check if the silence timer has passed the 5-second boundary
+    if (currentMs - lastAudioActivityMs >= IDLE_TIMEOUT_MS) {
+      renderIdleState();
+    } else {
+      // Normal interactive mode execution
+      applySmoothingFilters(mic1);
+      applySmoothingFilters(mic2);
+      renderAudioTunnel();
+    }
+  }
+
+  // 4. DECOUPLED DEBUG GATE: Runs exactly every 200ms regardless of FPS
   printDualPacketDebug();
 }
 
