@@ -23,7 +23,7 @@ const uint8_t SCREAM_OVERDRIVE_HUE  = 0;       // 0 = Crimson Red, 32 = Orange, 
 // --- System Sensitivity & Tuning ---
 static constexpr float    SCREAM_SMOOTH_LIMIT   = 0.85f;  // Percentage-based trigger for sustained volume peaks (0.0 to 1.0).
 static constexpr float    SCREAM_WHITE_HOT_BOOST = 120.0f; // Intensity of the white flash core (0.0 to 255.0).
-static constexpr uint32_t IDLE_TIMEOUT_MS       = 1000;   // Milliseconds of silence before idle kicks in.
+static constexpr uint32_t IDLE_TIMEOUT_MS       = 100;   // Milliseconds of silence before idle kicks in.
 static constexpr float    IDLE_SWEEP_SPEED      = 0.02f;  // Speed of the ambient idle ring sweep.
 
 // --- Global Hardware Layout Geometry ---
@@ -103,9 +103,9 @@ void fillAll(uint32_t color) {
 }
 
 void startupLedTest() {
-  fillAll(rgb(50, 0, 0)); delay(1000);
-  fillAll(rgb(0, 50, 0)); delay(1000);
-  fillAll(rgb(0, 0, 50)); delay(1000);
+  fillAll(rgb(40, 0, 0)); delay(1000);
+  fillAll(rgb(0, 40, 0)); delay(1000);
+  fillAll(rgb(0, 0, 40)); delay(1000);
   fillAll(rgb(0, 0, 0));   delay(1000);
 }
 
